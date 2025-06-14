@@ -110,11 +110,15 @@ class CCSRewardManager:
             if cot is None or se_dict is None:
                 res.append((cot, se_dict, -1))  # -1 represents error
             else:
-                res.append((cot, se_dict, len(container)))
                 extra_info = data_item.non_tensor_batch.get('extra_info', None)
                 assert extra_info is not None
                 session = json.loads(extra_info['session'])
-                prompt = self.data_formatter.format(session, cot, se_dict)
+                try:
+                    prompt = self.data_formatter.format(session, cot, se_dict)
+                except Exception:
+                    res.append((cot, se_dict, -1))
+                    continue
+                res.append((cot, se_dict, len(container)))
                 container.append(prompt)
         flags = self.request_service(container)
         return res, flags
