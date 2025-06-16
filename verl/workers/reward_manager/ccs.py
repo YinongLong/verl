@@ -52,7 +52,10 @@ class CCSRewardManager:
             else:
                 return data.batch['rm_scores']
 
-        cons_scores = data.batch['cons_scores']
+        if 'cons_scores' in data.batch:
+            cons_scores = data.batch['cons_scores']
+        else:
+            cons_scores = None
 
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
         reward_extra_info = defaultdict(list)
@@ -86,7 +89,7 @@ class CCSRewardManager:
             score = self.compute_score(
                 data_source=data_source,
                 solution_str=response_str,
-                cons_score=cons_scores[i],
+                cons_score=1.0 if cons_scores is None else cons_scores[i],
                 ground_truth=ground_truth,
                 extra_info=extra_info,
             )
@@ -114,7 +117,7 @@ class CCSRewardManager:
                         print(f"[{key}]", value)
                 else:
                     print("[score]", score)
-                print("[consistency]", cons_scores[i])
+                print("[consistency]", 1.0 if cons_scores is None else cons_scores[i])
 
         if return_dict:
             return {
