@@ -132,12 +132,17 @@ class TaskRunner:
         # The reward type depends on the tag of the data
         if config.reward_model.enable:
             if config.reward_model.strategy in ["fsdp", "fsdp2"]:
-                from verl.workers.fsdp_workers import RewardModelWorker
+                from verl.workers.fsdp_workers import RewardModelWorker, ConsRewardWorker
+                if config.reward_model.custom_kwargs.enable:
+                    reward_model_cls = ConsRewardWorker
+                else:
+                    reward_model_cls = RewardModelWorker
             elif config.reward_model.strategy == "megatron":
                 from verl.workers.megatron_workers import RewardModelWorker
+                reward_model_cls = RewardModelWorker
             else:
                 raise NotImplementedError
-            role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
+            role_worker_mapping[Role.RewardModel] = ray.remote(reward_model_cls)
             mapping[Role.RewardModel] = global_pool_id
 
         # Add a reference policy worker if KL loss or KL reward is used.

@@ -723,6 +723,12 @@ reward_model:
     # Max concurrent requests allowed to sandbox
     max_concurrent: 64
 
+  # custom reward model arguments
+  custom_kwargs:
+    enable: False
+    thk_tag: False
+
+
 # custom reward function definition
 custom_reward_function:
 
