@@ -1417,17 +1417,16 @@ class ConsRewardWorker(Worker):
                     revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
                     rm_scores = rm_scores[revert_indices]
 
-                for i, score in enumerate(rm_scores):
-                    scores[pos_mapping[i]] = score
+                scores.scatter_(0, torch.tensor(pos_mapping), rm_scores)
 
                 # Note that this is only the scores, may not be the final rewards used to train RL
                 output = DataProto.from_dict(tensors={"cons_scores": scores})
                 output = self.ulysses_sharding_manager.postprocess_data(data=output)
 
-        # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
-        # unshard the root FSDP module
-        if self.world_size > 1 and fsdp_version(self.reward_module) == 1:
-            self.reward_module._handle.reshard(True)
+            # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
+            # unshard the root FSDP module
+            if self.world_size > 1 and fsdp_version(self.reward_module) == 1:
+                self.reward_module._handle.reshard(True)
 
         output = output.to("cpu")
         return output
