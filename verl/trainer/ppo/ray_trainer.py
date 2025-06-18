@@ -74,6 +74,7 @@ class Role(Enum):
     RefPolicy = 4
     RewardModel = 5
     ActorRolloutRef = 6
+    ConsJudge = 7
 
 
 @dataclass
@@ -315,6 +316,7 @@ class RayPPOTrainer:
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = Role.RefPolicy in role_worker_mapping
         self.use_rm = Role.RewardModel in role_worker_mapping
+        self.use_cons_judge = Role.ConsJudge in role_worker_mapping
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name
         self.validation_generations_logger = ValidationGenerationsLogger()
@@ -648,6 +650,10 @@ class RayPPOTrainer:
 
             test_batch = test_batch.union(test_output_gen_batch)
 
+            if self.use_cons_judge:
+                cons_tensor = self.cons_judge_wg.compute_cons_score(test_batch)
+                test_batch = test_batch.union(cons_tensor)
+
             # evaluate using reward_function
             result = self.val_reward_fn(test_batch, return_dict=True)
             reward_tensor = result["reward_tensor"]
@@ -737,6 +743,11 @@ class RayPPOTrainer:
             rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
             self.resource_pool_to_cls[resource_pool]["rm"] = rm_cls
 
+        if self.use_cons_judge:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.ConsJudge)
+            cons_judge_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.ConsJudge], config=self.config.cons_judge)
+            self.resource_pool_to_cls[resource_pool]["cons_judge"] = cons_judge_cls
+
         # initialize WorkerGroup
         # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
         # you should not use `create_colocated_worker_cls`.
@@ -764,6 +775,10 @@ class RayPPOTrainer:
         if self.use_rm:
             self.rm_wg = all_wg["rm"]
             self.rm_wg.init_model()
+
+        if self.use_cons_judge:
+            self.cons_judge_wg = all_wg["cons_judge"]
+            self.cons_judge_wg.init_model()
 
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
         self.actor_rollout_wg = all_wg["actor_rollout"]
@@ -971,6 +986,12 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
+
+                    # add custom computation logic
+                    if self.use_cons_judge:
+                        with _timer("cons_judge", timing_raw):
+                            cons_tensor = self.cons_judge_wg.compute_cons_score(batch)
+                            batch = batch.union(cons_tensor)
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
