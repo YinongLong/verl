@@ -1256,6 +1256,7 @@ class ConsRewardWorker(Worker):
             from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input
 
         from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad_and_slice_inputs
+        self.reward_module.eval()
 
         with torch.no_grad(), torch.autocast(device_type=device_name, dtype=torch.bfloat16):
             input_ids = micro_batch["input_ids"]
