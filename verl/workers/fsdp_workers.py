@@ -1133,26 +1133,26 @@ class CriticWorker(Worker):
             offload_fsdp_optimizer(self.critic_optimizer)
 
 
-class ConsRewardWorker(Worker):
+class ConsJudgeWorker(Worker):
     """
-    Implements a custom reward model woker that uses the class AutoModelForCausalLM
+    Implements a custom judge model worker that uses the class `AutoModelForCausalLM`
     """
 
     def __init__(self, config):
         super().__init__()
+        self.config = config
         import torch.distributed
 
         if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend="nccl" if is_cuda_available else "hccl")
-        self.config = config
+            rank = int(os.environ.get("RANK", 0))
+            world_size = int(os.environ.get("WORLD_SIZE", 1))
+            torch.distributed.init_process_group(backend=f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}", rank=rank, world_size=world_size)
+
+        # build device mesh for FSDP
+        world_size = torch.distributed.get_world_size()
+        self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=self.config.model.fsdp_config.fsdp_size)
 
         # build device mesh for Ulysses Sequence Parallel
-        world_size = torch.distributed.get_world_size()
-        from torch.distributed.device_mesh import init_device_mesh
-
-        fsdp_size = self.config.model.fsdp_config.fsdp_size
-        self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=fsdp_size)
-
         self.ulysses_device_mesh = None
         self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
         dp = world_size // self.ulysses_sequence_parallel_size
@@ -1162,92 +1162,174 @@ class ConsRewardWorker(Worker):
             )
 
         self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
-        self.use_remove_padding = self.config.model.get("use_remove_padding", False)
+        self._is_offload_param = self.config.model.fsdp_config.get("param_offload", False)
 
         # normalize config
         if self.config.micro_batch_size is not None:
-            self.config.micro_batch_size //= torch.distributed.get_world_size()
+            self.config.micro_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
             self.config.micro_batch_size_per_gpu = self.config.micro_batch_size
+        self.num_showcases = self.config.get("num_showcases", 3)
 
-    def _build_model(self, config):
-        # the following line is necessary
-        from torch.distributed.fsdp import CPUOffload
+    def _build_model(
+        self,
+        model_path,
+        fsdp_config,
+        override_model_config,
+        use_remove_padding=False,
+        use_fused_kernels=False,
+        trust_remote_code=False,
+        use_liger=False
+    ):
+        from torch.distributed.fsdp import CPUOffload, MixedPrecision
         from transformers import AutoConfig, AutoModelForCausalLM
 
-        use_shm = config.model.get("use_shm", False)
-        # download the checkpoint from hdfs
-        local_path = copy_to_local(config.model.path, use_shm=use_shm)
+        from verl.utils.model import get_generation_config, print_model_size, update_model_config
+        from verl.utils.torch_dtypes import PrecisionType
 
-        input_tokenizer_local_path = copy_to_local(config.model.input_tokenizer, use_shm=use_shm)
-        # instantiate tokenizer for decoding stage
-        self.input_tokenizer = hf_tokenizer(input_tokenizer_local_path, trust_remote_code=config.model.get("trust_remote_code", False))
-        # instantiate tokenizer for reward model
-        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=config.model.get("trust_remote_code", False))
-        # instantiate data formatter
+        log_gpu_memory_usage("Before init `ConsJudgeWorker` from HF AutoModel", logger=logger)
+        local_path = model_path
+
+        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         self.data_formatter = consistency.DataFormatter(local_path)
+        self.de_tokenizer = hf_tokenizer(self.config.de_tokenizer_dir, trust_remote_code=trust_remote_code)
+        torch_dtype = fsdp_config.get("model_dtype", None)
+        if torch_dtype is None:
+            torch_dtype = torch.bfloat16
+        else:
+            torch_dtype = PrecisionType.to_dtype(torch_dtype)
+        # override model kwargs
+        model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code, attn_implementation="flash_attention_2")
 
-        trust_remote_code = config.model.get("trust_remote_code", False)
-        model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
+        self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
 
-        # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
+        override_config_kwargs = {
+            "bos_token_id": self.tokenizer.bos_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "pad_token_id": self.tokenizer.pad_token_id,
+        }
+        override_config_kwargs.update(override_model_config)
+        update_model_config(model_config, override_config_kwargs=override_config_kwargs)
+        if self.rank == 0:
+            print(f"Model config after override: {model_config}")
+
+        # NOTE(fix me): tie_word_embedding causes meta_tensor init to hang
         init_context = get_init_weight_context_manager(use_meta_tensor=not model_config.tie_word_embeddings, mesh=self.device_mesh)
 
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            reward_module = AutoModelForCausalLM.from_pretrained(
+            judge_module = AutoModelForCausalLM.from_pretrained(
                 pretrained_model_name_or_path=local_path,
+                torch_dtype=torch_dtype,
                 config=model_config,
-                torch_dtype=torch.bfloat16,
-                attn_implementation="flash_attention_2",
                 trust_remote_code=trust_remote_code,
             )
 
+            # Apply Liger kernel to the model if use_liger is set to True
+            if use_liger:
+                from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
+
+                _apply_liger_kernel_to_instance(model=judge_module)
+
+            fused_kernel_options = self.config.model.get("fused_kernel_options", None)
+            fused_kernels_backend = fused_kernel_options.get("impl_backend", None) if fused_kernel_options is not None else None
+
             apply_monkey_patch(
-                model=reward_module,
-                use_remove_padding=config.model.get("use_remove_padding", False),
+                model=judge_module,
+                use_remove_padding=use_remove_padding,
                 ulysses_sp_size=self.ulysses_sequence_parallel_size,
+                use_fused_kernels=use_fused_kernels,
+                fused_kernels_backend=fused_kernels_backend,
             )
 
-            reward_module.to(torch.bfloat16)
+            # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
+            judge_module.to(torch_dtype)
+        torch.distributed.barrier()
 
-        auto_wrap_policy = get_fsdp_wrap_policy(module=reward_module, config=self.config.model.fsdp_config)
+        if self.rank == 0:
+            print_model_size(judge_module)
+
+        log_gpu_memory_usage("After init `ConsJudgeWorker` from HF AutoModel", logger=logger)
+        # We wrap FSDP for rollout as well
+        mixed_precision_config = fsdp_config.get("mixed_precision", None)
+        if mixed_precision_config is not None:
+            param_dtype = PrecisionType.to_dtype(mixed_precision_config.get("param_dtype", "bf16"))
+            reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get("reduce_dtype", "fp32"))
+            buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get("buffer_dtype", "fp32"))
+        else:
+            param_dtype = torch.bfloat16
+            reduce_dtype = torch.float32
+            buffer_dtype = torch.float32
+
+        mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
+        auto_wrap_policy = get_fsdp_wrap_policy(module=judge_module, config=fsdp_config.get("wrap_policy", None), is_lora=self.config.model.get("lora_rank", 0) > 0)
+        if self.rank == 0:
+            print(f"wrap_policy: {auto_wrap_policy}")
 
         fsdp_mesh = self.device_mesh
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
 
-        if config.strategy == "fsdp":
-            reward_module = FSDP(
-                reward_module,
+        # TODO: add transformer policy
+        # We force reference policy to use CPUOffload to save memory.
+        # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
+        cpu_offload = CPUOffload(offload_params=True)
+        fsdp_strategy = self.config.strategy
+        if fsdp_strategy == "fsdp":
+            judge_module_fsdp = FSDP(
+                judge_module,
+                cpu_offload=cpu_offload,
                 param_init_fn=init_fn,
                 use_orig_params=False,
                 auto_wrap_policy=auto_wrap_policy,
-                device_id=get_torch_device().current_device(),
+                device_id=get_device_id(),
                 sharding_strategy=sharding_strategy,  # zero3
+                mixed_precision=mixed_precision,
                 sync_module_states=True,
-                cpu_offload=CPUOffload(offload_params=True),
-                forward_prefetch=self.config.model.fsdp_config.forward_prefetch,
                 device_mesh=self.device_mesh,
+                forward_prefetch=self.config.model.fsdp_config.forward_prefetch,
             )
-        elif config.strategy == "fsdp2":
+        elif fsdp_strategy == "fsdp2":
             assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
+            mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=True)
             cpu_offload = CPUOffloadPolicy(pin_memory=True)
+
             fsdp_kwargs = {
                 "mesh": fsdp_mesh,
+                "mp_policy": mp_policy,
                 "offload_policy": cpu_offload,
-                "reshard_after_forward": config.model.fsdp_config.reshard_after_forward,
+                "reshard_after_forward": fsdp_config.reshard_after_forward,
             }
-            full_state = reward_module.state_dict()
-            apply_fsdp2(reward_module, fsdp_kwargs, config.model.fsdp_config)
-            fsdp2_load_full_state_dict(reward_module, full_state, fsdp_mesh, cpu_offload)
+            full_state = judge_module.state_dict()
+            apply_fsdp2(judge_module, fsdp_kwargs, fsdp_config)
+            fsdp2_load_full_state_dict(judge_module, full_state, fsdp_mesh, cpu_offload)
+            judge_module_fsdp = judge_module
         else:
-            raise NotImplementedError(f"Unknown strategy: {config.strategy}")
-        return reward_module
+            raise NotImplementedError(f"not implement {fsdp_strategy}")
+
+        log_gpu_memory_usage("After `ConsJudgeWorker` FSDP init", logger=logger)
+        return judge_module_fsdp
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
-        self.reward_module = self._build_model(config=self.config)
+        from omegaconf import OmegaConf
+
+        override_model_config = OmegaConf.to_container(self.config.model.get("override_config", OmegaConf.create()))
+
+        self.use_remove_padding = self.config.model.get("use_remove_padding", False)
+        use_shm = self.config.model.get("use_shm", False)
+        use_fused_kernels = self.config.model.get("use_fused_kernels", False)
+        local_path = copy_to_local(self.config.model.path, use_shm=use_shm)
+        self.judge_module_fsdp = self._build_model(
+            model_path=local_path,
+            fsdp_config=self.config.model.fsdp_config,
+            override_model_config=override_model_config,
+            use_remove_padding=self.use_remove_padding,
+            use_fused_kernels=use_fused_kernels,
+            trust_remote_code=self.config.model.get("trust_remote_code", False),
+            use_liger=self.config.model.get("use_liger", False)
+        )
+        self.judge_module_fsdp.eval()
 
     def _forward_micro_batch(self, micro_batch):
         if is_cuda_available:
@@ -1256,14 +1338,13 @@ class ConsRewardWorker(Worker):
             from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input
 
         from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad_and_slice_inputs
-        self.reward_module.eval()
 
         with torch.no_grad(), torch.autocast(device_type=device_name, dtype=torch.bfloat16):
-            input_ids = micro_batch["input_ids"]
+            input_ids = micro_batch.batch["input_ids"]
             batch_size, seqlen = input_ids.shape
-            attention_mask = micro_batch["attention_mask"]
-            position_ids = micro_batch["position_ids"]
-            label_ids = micro_batch["label_ids"].squeeze(-1)
+            attention_mask = micro_batch.batch["attention_mask"]
+            position_ids = micro_batch.batch["position_ids"]
+            label_ids = micro_batch.batch["label_ids"].squeeze(-1)
 
             if self.use_remove_padding:
                 input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)  # input_ids_rmpad (total_nnz, ...)
@@ -1277,55 +1358,59 @@ class ConsRewardWorker(Worker):
                     input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad_and_slice_inputs(input_ids_rmpad, position_ids_rmpad, sp_size=self.ulysses_sequence_parallel_size)
 
                 # only pass input_ids and position_ids to enable flash_attn_varlen
-                output = self.reward_module(input_ids=input_ids_rmpad, attention_mask=None, position_ids=position_ids_rmpad, use_cache=False)
-                reward_rmpad = output.logits
-                reward_rmpad = reward_rmpad.squeeze(0)  # (total_nnz)
+                output = self.judge_module_fsdp(
+                    input_ids=input_ids_rmpad,
+                    attention_mask=None,
+                    position_ids=position_ids_rmpad,
+                    use_cache=False
+                )
+                judge_rmpad = output.logits
+                judge_rmpad = judge_rmpad.squeeze(0)  # (total_nnz)
 
                 # gather output if sp > 1
                 if self.ulysses_sequence_parallel_size > 1:
-                    reward_rmpad = gather_outpus_and_unpad(reward_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size)
+                    judge_rmpad = gather_outpus_and_unpad(judge_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size)
 
                 # pad it back
-                logits = pad_input(reward_rmpad, indices=indices, batch=batch_size, seqlen=seqlen).squeeze(-1)
+                logits = pad_input(judge_rmpad, indices=indices, batch=batch_size, seqlen=seqlen).squeeze(-1)
             else:
-                output = self.reward_module(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, use_cache=False)
+                output = self.judge_module_fsdp(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    use_cache=False
+                )
                 logits = output.logits
                 logits = logits.squeeze(-1)
 
             logits = logits[:, -1, :]
             logprobs = logprobs_from_logits_v2(logits, label_ids)
-            rm_score = torch.exp(logprobs)
+            m_score = torch.exp(logprobs)
 
-            return rm_score
+            return m_score
 
-    def _rebuild_model_input(self, data: DataProto):
-        src_max_length = data.batch["attention_mask"].shape[-1]
-
-        src_tokenizer = self.input_tokenizer
-        target_tokenizer = self.tokenizer
-
-        rm_input_ids = []
-        rm_attention_mask = []
-        rm_label_ids = []
-
+    def _rebuild_model_input(self, data):
+        m_input_ids = []
+        m_attention_mask = []
+        m_label_ids = []
         pos_mapping = []
-        for i in range(data.batch.batch_size[0]):
-            # extract response
-            response_ids = data.batch["responses"][i]
-            response_length = response_ids.shape[-1]
-            valid_response_length = data.batch["attention_mask"][i][-response_length:].sum()
+        for i in range(len(data)):
+            data_item = data[i]
+            prompt_ids = data_item.batch["prompts"]
+            prompt_length = prompt_ids.shape[-1]
+            response_ids = data_item.batch["responses"]
+            valid_response_length = data_item.batch["attention_mask"][prompt_length:].sum()
             valid_response_ids = response_ids[:valid_response_length]
 
-            # decode
-            response = src_tokenizer.decode(valid_response_ids, skip_special_tokens=True)
-            cot, se_dict_str = extract_think_answer(response, self.config.custom_kwargs.get('thk_tag', False))
+            res_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+
+            cot, se_dict_str = extract_think_answer(res_str, self.config.get("thk_tag", False))
             se_dict = parse_se_dict_str(se_dict_str)
-            if cot is None or se_dict is None:
+            if cot is None or not cot or se_dict is None:
                 continue
 
-            extra_info = data[i].non_tensor_batch.get('extra_info', None)
-            assert extra_info is not None
-            session = json.loads(extra_info['session'])
+            extra_info = data_item.non_tensor_batch["extra_info"]
+            session = json.loads(extra_info["session"])
             try:
                 prompt = self.data_formatter.format(session, cot, se_dict)
             except Exception:
@@ -1333,92 +1418,75 @@ class ConsRewardWorker(Worker):
 
             pos_mapping.append(i)
 
-            if self.rank == 0 and i == 0:
+            if self.rank == 0 and i == 0 and self.num_showcases:
                 # for debugging purpose
                 print(f"cons-prompt: {prompt}")
+                self.num_showcases -= 1
 
             # the maximum length is actually determined by the reward model itself
-            max_length = self.config.get("max_length", src_max_length)
-            if max_length is None:
-                max_length = src_max_length
-
-            model_inputs = target_tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
-            label_inps = target_tokenizer(
+            max_length = self.config.get("max_length", 2048)
+            model_inputs = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+            label_inps = self.tokenizer(
                 consistency.DataFormatter.yes_flag, return_tensors="pt", add_special_tokens=False
             )
-            rm_label_ids.append(label_inps["input_ids"])
+            m_label_ids.append(label_inps["input_ids"])
 
             input_ids, attention_mask = verl_F.postprocess_data(
                 input_ids=model_inputs["input_ids"],
                 attention_mask=model_inputs["attention_mask"],
                 max_length=max_length,
-                pad_token_id=target_tokenizer.pad_token_id,
+                pad_token_id=self.tokenizer.pad_token_id,
                 left_pad=True,  # right padding
                 truncation=self.config.get("truncation", "left"),
             )  # truncate from the right
 
-            rm_input_ids.append(input_ids)
-            rm_attention_mask.append(attention_mask)
+            m_input_ids.append(input_ids)
+            m_attention_mask.append(attention_mask)
 
         if not pos_mapping:
             return None, pos_mapping
 
-        rm_input_ids = torch.cat(rm_input_ids, dim=0)
-        rm_attention_mask = torch.cat(rm_attention_mask, dim=0)
-        rm_label_ids = torch.cat(rm_label_ids, dim=0)
+        m_input_ids = torch.cat(m_input_ids, dim=0)
+        m_attention_mask = torch.cat(m_attention_mask, dim=0)
+        m_label_ids = torch.cat(m_label_ids, dim=0)
 
-        rm_position_ids = compute_position_id_with_mask(rm_attention_mask)
+        m_position_ids = compute_position_id_with_mask(m_attention_mask)
 
-        rm_inputs = {
-            "input_ids": rm_input_ids,
-            "attention_mask": rm_attention_mask,
-            "position_ids": rm_position_ids,
-            "label_ids": rm_label_ids
+        m_inputs = {
+            "input_ids": m_input_ids,
+            "attention_mask": m_attention_mask,
+            "position_ids": m_position_ids,
+            "label_ids": m_label_ids
         }
 
-        return DataProto.from_dict(rm_inputs), pos_mapping
+        return DataProto.from_dict(m_inputs), pos_mapping
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-    def compute_rm_score(self, data: DataProto):
-        import itertools
-
-        from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
-
+    def compute_cons_score(self, data: DataProto):
         # Support all hardwares
-        data = data.to(get_torch_device().current_device())
-
         batch_size = data.batch.batch_size[0]
-        scores = torch.ones((batch_size, ), dtype=torch.float32)
+        data = data.to(get_device_id())
 
-        rm_data, pos_mapping = self._rebuild_model_input(data)
-        if rm_data is None:
+        m_data, pos_mapping = self._rebuild_model_input(data)
+
+        if m_data is None:
+            scores = torch.zeros((batch_size, ), dtype=torch.float32)
             output = DataProto.from_dict(tensors={"cons_scores": scores})
         else:
             # Support all hardwares
-            rm_data.batch = rm_data.batch.to(get_torch_device().current_device())
+            m_data = m_data.to(get_device_id())
+            scores = torch.zeros((batch_size, ), dtype=torch.float32, device=m_data.batch.device)
 
             # perform forward computation
             with self.ulysses_sharding_manager:
-                rm_data = self.ulysses_sharding_manager.preprocess_data(data=rm_data)
-                use_dynamic_bsz = self.config.use_dynamic_bsz
-                if use_dynamic_bsz:
-                    max_token_len = self.config.forward_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                    micro_batches, indices = rearrange_micro_batches(batch=rm_data.batch, max_token_len=max_token_len)
-                else:
-                    micro_batches = rm_data.batch.split(self.config.micro_batch_size_per_gpu)
+                m_data = self.ulysses_sharding_manager.preprocess_data(data=m_data)
+                micro_batches = m_data.batch.split(self.config.micro_batch_size_per_gpu)
                 output = []
                 for micro_batch in micro_batches:
-                    rm_score = self._forward_micro_batch(micro_batch)
-                    output.append(rm_score)
-                rm_scores = torch.cat(output, dim=0)  # (batch_size)
-
-                if use_dynamic_bsz:
-                    indices = list(itertools.chain.from_iterable(indices))
-                    assert len(indices) == rm_scores.size(0), f"{len(indices)} vs. {rm_scores.size()}"
-                    revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
-                    rm_scores = rm_scores[revert_indices]
-
-                scores.scatter_(0, torch.tensor(pos_mapping), rm_scores)
+                    m_score = self._forward_micro_batch(micro_batch)
+                    output.append(m_score)
+                m_scores = torch.cat(output, dim=0)  # (batch_size)
+                scores.scatter_(0, torch.tensor(pos_mapping), m_scores)
 
                 # Note that this is only the scores, may not be the final rewards used to train RL
                 output = DataProto.from_dict(tensors={"cons_scores": scores})
@@ -1426,8 +1494,8 @@ class ConsRewardWorker(Worker):
 
             # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
             # unshard the root FSDP module
-            if self.world_size > 1 and fsdp_version(self.reward_module) == 1:
-                self.reward_module._handle.reshard(True)
+            if self.world_size > 1 and fsdp_version(self.judge_module_fsdp) == 1:
+                self.judge_module_fsdp._handle.reshard(True)
 
         output = output.to("cpu")
         return output
