@@ -1473,6 +1473,9 @@ class ConsJudgeWorker(Worker):
             scores = torch.zeros((batch_size, ), dtype=torch.float32)
             output = DataProto.from_dict(tensors={"cons_scores": scores})
         else:
+            if self._is_offload_param:
+                load_fsdp_model_to_gpu(self.judge_module_fsdp)
+
             # Support all hardwares
             m_data = m_data.to(get_device_id())
             scores = torch.zeros((batch_size, ), dtype=torch.float32, device=m_data.batch.device)
@@ -1497,7 +1500,12 @@ class ConsJudgeWorker(Worker):
             if self.world_size > 1 and fsdp_version(self.judge_module_fsdp) == 1:
                 self.judge_module_fsdp._handle.reshard(True)
 
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.judge_module_fsdp)
+                log_gpu_memory_usage("After offload `ConsJudgeWorker` model during compute_cons_score", logger=logger)
+
         output = output.to("cpu")
+
         return output
 
 
