@@ -94,10 +94,12 @@ class CCSRewardManager:
             else:
                 reward = score
 
+            mode = extra_info.get('mode', 'analysis')
             cons_score = -1.0
             if "cons_scores" in data_item.batch:
                 cons_score = data_item.batch["cons_scores"]
-                reward *= cons_score
+                if mode == 'analysis':
+                    reward *= cons_score
 
             reward_tensor[i, valid_response_length - 1] = reward
 
@@ -115,6 +117,7 @@ class CCSRewardManager:
                 else:
                     print("[score]", score)
                 print("[cons_score]", cons_score)
+                print("[mode]", mode)
 
         if return_dict:
             return {
