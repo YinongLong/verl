@@ -75,6 +75,7 @@ class Role(Enum):
     RewardModel = 5
     ActorRolloutRef = 6
     ConsJudge = 7
+    DistillTeacher = 8
 
 
 @dataclass
@@ -316,6 +317,7 @@ class RayPPOTrainer:
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = Role.RefPolicy in role_worker_mapping
         self.use_rm = Role.RewardModel in role_worker_mapping
+        self.for_kd = Role.DistillTeacher in role_worker_mapping
         self.use_cons_judge = Role.ConsJudge in role_worker_mapping
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name
@@ -339,6 +341,7 @@ class RayPPOTrainer:
             AdvantageEstimator.RLOO,
             AdvantageEstimator.OPO,
             AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE,
+            AdvantageEstimator.REVERT_PROB
         ]:
             self.use_critic = False
         else:
@@ -599,7 +602,7 @@ class RayPPOTrainer:
             test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True)
 
             # we only do validation on rule-based rm
-            if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
+            if (self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model") or self.for_kd:
                 return {}
 
             # Store original inputs
@@ -743,6 +746,11 @@ class RayPPOTrainer:
             rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
             self.resource_pool_to_cls[resource_pool]["rm"] = rm_cls
 
+        if self.for_kd:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.DistillTeacher)
+            dt_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.DistillTeacher], config=self.config.distill_knowledge)
+            self.resource_pool_to_cls[resource_pool]["dt"] = dt_cls
+
         if self.use_cons_judge:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.ConsJudge)
             cons_judge_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.ConsJudge], config=self.config.cons_judge)
@@ -775,6 +783,10 @@ class RayPPOTrainer:
         if self.use_reference_policy and not self.ref_in_actor:
             self.ref_policy_wg = all_wg["ref"]
             self.ref_policy_wg.init_model()
+
+        if self.for_kd:
+            self.dt_wg = all_wg["dt"]
+            self.dt_wg.init_model()
 
         if self.use_rm:
             self.rm_wg = all_wg["rm"]
@@ -947,6 +959,10 @@ class RayPPOTrainer:
                         self.critic_wg.start_profile()
                     if self.use_rm:
                         self.rm_wg.start_profile()
+                    if self.for_kd:
+                        self.dt_wg.start_profile()
+                    if self.use_cons_judge:
+                        self.cons_judge_wg.start_profile()
 
                 metrics = {}
                 timing_raw = {}
@@ -1003,7 +1019,7 @@ class RayPPOTrainer:
 
                     # add custom computation logic
                     if self.use_cons_judge:
-                        with _timer("cons_judge", timing_raw):
+                        with marked_timer("cons_judge", timing_raw, color="green"):
                             cons_tensor = self.cons_judge_wg.compute_cons_score(batch)
                             batch = batch.union(cons_tensor)
 
@@ -1023,6 +1039,10 @@ class RayPPOTrainer:
                         # compute reward model score
                         if self.use_rm:
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
+                            batch = batch.union(reward_tensor)
+
+                        if self.for_kd:
+                            reward_tensor = self.dt_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
 
                         if self.config.reward_model.launch_reward_fn_async:
@@ -1125,6 +1145,7 @@ class RayPPOTrainer:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                            batch.meta_info["for_kd"] = self.for_kd
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)

@@ -1161,13 +1161,14 @@ class CriticWorker(Worker, WorkerProfilerExtension):
             offload_fsdp_optimizer(self.critic_optimizer)
 
 
-class ConsJudgeWorker(Worker):
+class ConsJudgeWorker(Worker, WorkerProfilerExtension):
     """
     Implements a custom judge model worker that uses the class `AutoModelForCausalLM`
     """
 
     def __init__(self, config):
-        super().__init__()
+        Worker.__init__(self)
+
         self.config = config
         import torch.distributed
 
@@ -1190,6 +1191,11 @@ class ConsJudgeWorker(Worker):
             )
 
         self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
+        profiler_config = ProfilerConfig()
+        profiler_config = profiler_config.union(ProfilerConfig(**OmegaConf.to_object(config.get("profiler", DictConfig({})))))
+
+        WorkerProfilerExtension.__init__(self, WorkerProfiler(rank=self.rank, config=profiler_config))
+        
         self._is_offload_param = self.config.model.fsdp_config.get("param_offload", False)
 
         # normalize config
@@ -1238,7 +1244,7 @@ class ConsJudgeWorker(Worker):
         override_config_kwargs.update(override_model_config)
         update_model_config(model_config, override_config_kwargs=override_config_kwargs)
         if self.rank == 0:
-            print(f"Model config after override: {model_config}")
+            print(f"Judger Model config after override: {model_config}")
 
         # NOTE(fix me): tie_word_embedding causes meta_tensor init to hang
         init_context = get_init_weight_context_manager(use_meta_tensor=not model_config.tie_word_embeddings, mesh=self.device_mesh)
@@ -1490,6 +1496,7 @@ class ConsJudgeWorker(Worker):
         return DataProto.from_dict(m_inputs), pos_mapping
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    @WorkerProfiler.annotate(color="green")
     def compute_cons_score(self, data: DataProto):
         # Support all hardwares
         batch_size = data.batch.batch_size[0]
@@ -1533,6 +1540,241 @@ class ConsJudgeWorker(Worker):
                 log_gpu_memory_usage("After offload `ConsJudgeWorker` model during compute_cons_score", logger=logger)
 
         output = output.to("cpu")
+
+        return output
+
+
+class DistillTeacherWorker(Worker, WorkerProfilerExtension):
+    """
+    This worker is using in knowledge distillation
+    """
+
+    def __init__(self, config):
+        Worker.__init__(self)
+        self.config = config
+        import torch.distributed
+
+        if not torch.distributed.is_initialized():
+            rank = int(os.environ.get("RANK", 0))
+            world_size = int(os.environ.get("WORLD_SIZE", 1))
+            torch.distributed.init_process_group(backend=f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}", rank=rank, world_size=world_size)
+
+        world_size = torch.distributed.get_world_size()
+        self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=self.config.teacher.fsdp_config.fsdp_size)
+
+        self.ulysses_device_mesh = None
+        self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
+        dp = world_size // self.ulysses_sequence_parallel_size
+        if self.ulysses_sequence_parallel_size > 1:
+            self.ulysses_device_mesh = init_device_mesh(device_name, mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"])
+
+        self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
+        profiler_config = ProfilerConfig()
+        profiler_config = profiler_config.union(ProfilerConfig(**OmegaConf.to_object(config.get("profiler", DictConfig({})))))
+
+        WorkerProfilerExtension.__init__(self, WorkerProfiler(rank=self.rank, config=profiler_config))
+
+        self._is_offload_param = self.config.teacher.fsdp_config.get("param_offload", False)
+        if self.config.log_prob_micro_batch_size is not None:
+            self.config.log_prob_micro_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
+            self.config.log_prob_micro_batch_size_per_gpu = self.config.log_prob_micro_batch_size
+
+    def _build_model(self,
+        model_path,
+        fsdp_config,
+        override_model_config,
+        use_remove_padding=False,
+        use_fused_kernels=False,
+        trust_remote_code=False,
+        use_liger=False
+    ):
+        from torch.distributed.fsdp import CPUOffload, MixedPrecision
+        from transformers import AutoConfig, AutoModelForCausalLM
+
+        from verl.utils.model import get_generation_config, print_model_size, update_model_config
+        from verl.utils.torch_dtypes import PrecisionType
+
+        log_gpu_memory_usage("Before init `Teacher` from HF AutoModel", logger=logger)
+        local_path = model_path
+
+        # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
+        # TODO(zhangchi.usc1992): 1. support create from random initialized model. 2. Support init with FSDP directly
+        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code)
+
+        torch_dtype = fsdp_config.get("model_dtype", None)
+        if torch_dtype is None:
+            torch_dtype = torch.bfloat16
+        else:
+            torch_dtype = PrecisionType.to_dtype(torch_dtype)
+
+        # override model kwargs
+        teacher_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code, attn_implementation="flash_attention_2")
+        self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
+        override_config_kwargs = {
+            "bos_token_id": self.tokenizer.bos_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "pad_token_id": self.tokenizer.pad_token_id,
+        }
+        override_config_kwargs.update(override_model_config)
+        update_model_config(teacher_model_config, override_config_kwargs=override_config_kwargs)
+        if self.rank == 0:
+            print(f"Teacher Model config after override: {teacher_model_config}")
+
+        # NOTE(fix me): tie_word_embedding causes meta_tensor init to hang
+        init_context = get_init_weight_context_manager(use_meta_tensor=not teacher_model_config.tie_word_embeddings, mesh=self.device_mesh)
+
+        with init_context(), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            teacher_module = AutoModelForCausalLM.from_pretrained(
+                pretrained_model_name_or_path=local_path,
+                torch_dtype=torch_dtype,
+                config=teacher_model_config,
+                trust_remote_code=trust_remote_code,
+            )
+
+            # Apply Liger kernel to the model if use_liger is set to True
+            if use_liger:
+                from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
+
+                _apply_liger_kernel_to_instance(model=teacher_module)
+
+            fused_kernel_options = self.config.teacher.get("fused_kernel_options", None)
+            fused_kernels_backend = fused_kernel_options.get("impl_backend", None) if fused_kernel_options is not None else None
+
+            apply_monkey_patch(
+                model=teacher_module,
+                use_remove_padding=use_remove_padding,
+                ulysses_sp_size=self.ulysses_sequence_parallel_size,
+                use_fused_kernels=use_fused_kernels,
+                fused_kernels_backend=fused_kernels_backend,
+            )
+
+            # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
+            teacher_module.to(torch_dtype)
+
+        torch.distributed.barrier()
+
+        if self.rank == 0:
+            print_model_size(teacher_module)
+
+        log_gpu_memory_usage("After init `Teacher` from HF AutoModel", logger=logger)
+
+        # We wrap FSDP for rollout as well
+        mixed_precision_config = fsdp_config.get("mixed_precision", None)
+        if mixed_precision_config is not None:
+            param_dtype = PrecisionType.to_dtype(mixed_precision_config.get("param_dtype", "bf16"))
+            reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get("reduce_dtype", "fp32"))
+            buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get("buffer_dtype", "fp32"))
+        else:
+            param_dtype = torch.bfloat16
+            reduce_dtype = torch.float32
+            buffer_dtype = torch.float32
+
+        mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
+
+        auto_wrap_policy = get_fsdp_wrap_policy(module=teacher_module, config=fsdp_config.get("wrap_policy", None), is_lora=self.config.teacher.get("lora_rank", 0) > 0)
+
+        if self.rank == 0:
+            print(f"wrap_policy: {auto_wrap_policy}")
+
+        fsdp_mesh = self.device_mesh
+        sharding_strategy = get_sharding_strategy(fsdp_mesh)
+
+        # TODO: add transformer policy
+        # We force reference policy to use CPUOffload to save memory.
+        # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
+        cpu_offload = CPUOffload(offload_params=True)
+        fsdp_strategy = self.config.strategy
+        if fsdp_strategy == "fsdp":
+            teacher_module_fsdp = FSDP(
+                teacher_module,
+                cpu_offload=cpu_offload,
+                param_init_fn=init_fn,
+                use_orig_params=False,
+                auto_wrap_policy=auto_wrap_policy,
+                device_id=get_device_id(),
+                sharding_strategy=sharding_strategy,  # zero3
+                mixed_precision=mixed_precision,
+                sync_module_states=True,
+                device_mesh=self.device_mesh,
+                forward_prefetch=self.config.teacher.fsdp_config.forward_prefetch,
+            )
+        elif fsdp_strategy == "fsdp2":
+            assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
+            mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=True)
+            cpu_offload = CPUOffloadPolicy(pin_memory=True)
+
+            fsdp_kwargs = {
+                "mesh": fsdp_mesh,
+                "mp_policy": mp_policy,
+                "offload_policy": cpu_offload,
+                "reshard_after_forward": fsdp_config.reshard_after_forward,
+            }
+            full_state = teacher_module.state_dict()
+            apply_fsdp2(teacher_module, fsdp_kwargs, fsdp_config)
+            fsdp2_load_full_state_dict(teacher_module, full_state, fsdp_mesh, cpu_offload)
+            teacher_module_fsdp = teacher_module
+        else:
+            raise NotImplementedError(f"not implement {fsdp_strategy}")
+
+        log_gpu_memory_usage("After `Teacher` FSDP init", logger=logger)
+
+        return teacher_module_fsdp
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_model(self):
+        from verl.workers.actor import DataParallelPPOActor
+
+        import_external_libs(self.config.teacher.get("external_lib", None))
+
+        from omegaconf import OmegaConf
+
+        override_model_config = OmegaConf.to_container(self.config.teacher.get("override_config", OmegaConf.create()))
+
+        use_remove_padding = self.config.teacher.get("use_remove_padding", False)
+        use_shm = self.config.teacher.get("use_shm", False)
+        use_fused_kernels = self.config.teacher.get("use_fused_kernels", False)
+
+        local_path = copy_to_local(self.config.teacher.path, use_shm=use_shm)
+        self.dt_module_fsdp = self._build_model(
+            model_path=local_path,
+            fsdp_config=self.config.teacher.fsdp_config,
+            override_model_config=override_model_config,
+            use_remove_padding=use_remove_padding,
+            use_fused_kernels=use_fused_kernels,
+            trust_remote_code=self.config.teacher.get("trust_remote_code", False),
+            use_liger=self.config.teacher.get("use_liger", False)
+        )
+        OmegaConf.set_struct(self.config.teacher, True)
+        with open_dict(self.config.teacher):
+            self.config.teacher.use_remove_padding = use_remove_padding
+            self.config.teacher.use_fused_kernels = use_fused_kernels
+        self.teacher_policy = DataParallelPPOActor(config=self.config.teacher, actor_module=self.dt_module_fsdp)
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    @WorkerProfiler.annotate(color="yellow")
+    def compute_rm_score(self, data: DataProto):
+        # Support all hardwares
+        data = data.to(get_device_id())
+
+        micro_batch_size = self.config.log_prob_micro_batch_size_per_gpu
+        data.meta_info["micro_batch_size"] = micro_batch_size
+        data.meta_info["temperature"] = self.config.temperature
+        data.meta_info["max_token_len"] = self.config.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.log_prob_use_dynamic_bsz
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data)
+            output, _ = self.teacher_policy.compute_log_prob(data=data, calculate_entropy=False)
+            output = DataProto.from_dict(tensors={"rm_scores": output})
+            output = self.ulysses_sharding_manager.postprocess_data(output)
+
+        output = output.to("cpu")
+
+        # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
+        # unshard the root FSDP module
+        if self.world_size > 1 and fsdp_version(self.teacher_policy.actor_module) == 1:
+            self.teacher_policy.actor_module._handle.reshard(True)
 
         return output
 

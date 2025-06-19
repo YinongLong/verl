@@ -135,6 +135,9 @@ class TaskRunner:
             Role.Critic: global_pool_id,
         }
 
+        if config.reward_model.enable and config.distill_knowledge.enable:
+            raise ValueError('`reward_model.enable` and `distill_knowledge.enable` cannot be `True` at the same time!')
+
         # We should adopt a multi-source reward function here:
         # - for rule-based rm, we directly call a reward score
         # - for model-based rm, we call a model
@@ -150,6 +153,11 @@ class TaskRunner:
                 raise NotImplementedError
             role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
             mapping[Role.RewardModel] = global_pool_id
+
+        if config.distill_knowledge.enable:
+            from verl.workers.fsdp_workers import DistillTeacherWorker
+            role_worker_mapping[Role.DistillTeacher] = ray.remote(DistillTeacherWorker)
+            mapping[Role.DistillTeacher] = global_pool_id
 
         if config.cons_judge.enable:
             from verl.workers.fsdp_workers import ConsJudgeWorker

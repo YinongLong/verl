@@ -796,6 +796,32 @@ custom_reward_function:
   # The name of the reward function within the specified file. Default is 'compute_score'.
   name: compute_score
 
+
+distill_knowledge:
+  enable: False
+  strategy: fsdp
+  temperature: 1.0
+  teacher:
+    path: null
+    trust_remote_code: False
+    fsdp_config:
+      param_offload: False
+      fsdp_size: -1
+      forward_prefetch: False
+      reshard_after_forward: False
+    use_remove_padding: False
+    use_shm: False
+    use_fused_kernels: False
+    use_liger: False
+    fused_kernel_options:
+      impl_backend: torch
+  ulysses_sequence_parallel_size: 1
+  log_prob_micro_batch_size: null
+  log_prob_micro_batch_size_per_gpu: null
+  log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
+  log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
+
+
 cons_judge:
   enable: False
   max_length: 2048
