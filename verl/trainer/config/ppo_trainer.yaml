@@ -815,7 +815,10 @@ distill_knowledge:
     use_liger: False
     fused_kernel_options:
       impl_backend: torch
-  ulysses_sequence_parallel_size: 1
+    ulysses_sequence_parallel_size: 1
+    entropy_from_logits_with_chunking: False
+    use_torch_compile: True
+    entropy_checkpointing: False
   log_prob_micro_batch_size: null
   log_prob_micro_batch_size_per_gpu: null
   log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}

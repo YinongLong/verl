@@ -1563,7 +1563,7 @@ class DistillTeacherWorker(Worker, WorkerProfilerExtension):
         self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=self.config.teacher.fsdp_config.fsdp_size)
 
         self.ulysses_device_mesh = None
-        self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
+        self.ulysses_sequence_parallel_size = self.config.teacher.get("ulysses_sequence_parallel_size", 1)
         dp = world_size // self.ulysses_sequence_parallel_size
         if self.ulysses_sequence_parallel_size > 1:
             self.ulysses_device_mesh = init_device_mesh(device_name, mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"])
