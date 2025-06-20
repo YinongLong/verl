@@ -602,7 +602,7 @@ class RayPPOTrainer:
             test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True)
 
             # we only do validation on rule-based rm
-            if (self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model") or self.for_kd:
+            if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
                 return {}
 
             # Store original inputs

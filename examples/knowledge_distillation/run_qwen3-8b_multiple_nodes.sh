@@ -52,6 +52,7 @@ ray job submit --no-wait --address="http://xxx.xxx.xxx.xxx:port" \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
     actor_rollout_ref.rollout.n=16 \
+    reward_model.reward_manager=ccs \
     distill_knowledge.enable=True \
     distill_knowledge.temperature=1.0 \
     distill_knowledge.log_prob_micro_batch_size_per_gpu=32 \
