@@ -39,6 +39,7 @@ ray job submit --no-wait --address="http://xxx.xxx.xxx.xxx:port" \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.8 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.actor.policy_loss_coef=0.2 \
     actor_rollout_ref.actor.optim.lr=1e-5 \
     actor_rollout_ref.actor.optim.lr_warmup_steps=5 \
     actor_rollout_ref.actor.optim.min_lr_ratio=0.1 \
