@@ -332,7 +332,6 @@ class DataParallelPPOActor(BasePPOActor):
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
-        for_kd = data.meta_info.get("for_kd", False)
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
         if multi_turn:
@@ -409,8 +408,7 @@ class DataParallelPPOActor(BasePPOActor):
                         cliprange_low=clip_ratio_low,
                         cliprange_high=clip_ratio_high,
                         clip_ratio_c=clip_ratio_c,
-                        loss_agg_mode=loss_agg_mode,
-                        for_kd=for_kd
+                        loss_agg_mode=loss_agg_mode
                     )
 
                     if entropy_coeff != 0:
