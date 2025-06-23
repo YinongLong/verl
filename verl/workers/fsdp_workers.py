@@ -1170,7 +1170,7 @@ class CriticWorker(Worker, DistProfilerExtension):
             offload_fsdp_optimizer(self.critic_optimizer)
 
 
-class ConsJudgeWorker(Worker, WorkerProfilerExtension):
+class ConsJudgeWorker(Worker, DistProfilerExtension):
     """
     Implements a custom judge model worker that uses the class `AutoModelForCausalLM`
     """
@@ -1200,11 +1200,11 @@ class ConsJudgeWorker(Worker, WorkerProfilerExtension):
             )
 
         self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
-        profiler_config = ProfilerConfig()
-        profiler_config = profiler_config.union(ProfilerConfig(**OmegaConf.to_object(config.get("profiler", DictConfig({})))))
+        profiler_config: Optional[ProfilerConfig] = None
+        profiler_config = omega_conf_to_dataclass(config.get("profiler", {}), ProfilerConfig)
 
-        WorkerProfilerExtension.__init__(self, WorkerProfiler(rank=self.rank, config=profiler_config))
-        
+        DistProfilerExtension.__init__(self, DistProfiler(rank=self.rank, config=profiler_config))
+
         self._is_offload_param = self.config.model.fsdp_config.get("param_offload", False)
 
         # normalize config
@@ -1355,7 +1355,6 @@ class ConsJudgeWorker(Worker, WorkerProfilerExtension):
     def init_model(self):
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
-        from omegaconf import OmegaConf
 
         override_model_config = OmegaConf.to_container(self.config.model.get("override_config", OmegaConf.create()))
 
@@ -1445,7 +1444,7 @@ class ConsJudgeWorker(Worker, WorkerProfilerExtension):
             valid_response_length = data_item.batch["attention_mask"][prompt_length:].sum()
             valid_response_ids = response_ids[:valid_response_length]
 
-            res_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+            res_str = self.de_tokenizer.decode(valid_response_ids, skip_special_tokens=True)
 
             cot, se_dict_str = extract_think_answer(res_str, self.config.get("thk_tag", False))
             se_dict = parse_se_dict_str(se_dict_str)
@@ -1505,7 +1504,7 @@ class ConsJudgeWorker(Worker, WorkerProfilerExtension):
         return DataProto.from_dict(m_inputs), pos_mapping
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-    @WorkerProfiler.annotate(color="green")
+    @DistProfiler.annotate(color="green")
     def compute_cons_score(self, data: DataProto):
         # Support all hardwares
         batch_size = data.batch.batch_size[0]
