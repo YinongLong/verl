@@ -925,6 +925,10 @@ cons_judge:
 # config for the algorithm
 algorithm:
 
+  filter_groups:
+
+    enable: False
+
   # Discount factor for future rewards
   gamma: 1.0
 

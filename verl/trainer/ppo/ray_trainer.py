@@ -958,6 +958,9 @@ class RayPPOTrainer:
         self.global_steps += 1
         last_val_metrics = None
 
+        num_prompts_in_batch = 0
+        batch = None
+
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 do_profile = self.global_steps in self.config.trainer.profile_steps if self.config.trainer.profile_steps is not None else False
@@ -974,20 +977,22 @@ class RayPPOTrainer:
 
                 metrics = {}
                 timing_raw = {}
-                batch: DataProto = DataProto.from_single_dict(batch_dict)
+
+                ori_batch: DataProto = DataProto.from_single_dict(batch_dict)
 
                 # pop those keys for generation
                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
                 non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
-                if "multi_modal_data" in batch.non_tensor_batch:
+                if "multi_modal_data" in ori_batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("multi_modal_data")
-                if "raw_prompt" in batch.non_tensor_batch:
+                if "raw_prompt" in ori_batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("raw_prompt")
-                if "tools_kwargs" in batch.non_tensor_batch:
+                if "tools_kwargs" in ori_batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("tools_kwargs")
-                if "interaction_kwargs" in batch.non_tensor_batch:
+                if "interaction_kwargs" in ori_batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("interaction_kwargs")
-                gen_batch = batch.pop(
+
+                gen_batch = ori_batch.pop(
                     batch_keys=batch_keys_to_pop,
                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
                 )
@@ -1012,49 +1017,90 @@ class RayPPOTrainer:
                             gen_baseline_batch.meta_info["do_sample"] = False
                             gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
 
-                            batch = batch.union(gen_baseline_output)
-                            reward_baseline_tensor = self.reward_fn(batch)
+                            ori_batch = ori_batch.union(gen_baseline_output)
+                            reward_baseline_tensor = self.reward_fn(ori_batch)
                             reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
 
-                            batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
+                            ori_batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
 
-                            batch.batch["reward_baselines"] = reward_baseline_tensor
+                            ori_batch.batch["reward_baselines"] = reward_baseline_tensor
 
                             del gen_baseline_batch, gen_baseline_output
 
-                    batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
+                    ori_batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(ori_batch.batch))], dtype=object)
                     # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    batch = batch.union(gen_batch_output)
+                    ori_batch = ori_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    ori_batch = ori_batch.union(gen_batch_output)
 
                     # add custom computation logic
                     if self.use_cons_judge:
                         with marked_timer("cons_judge", timing_raw, color="green"):
-                            cons_tensor = self.cons_judge_wg.compute_cons_score(batch)
-                            batch = batch.union(cons_tensor)
+                            cons_tensor = self.cons_judge_wg.compute_cons_score(ori_batch)
+                            ori_batch = ori_batch.union(cons_tensor)
 
-                    batch.batch["response_mask"] = compute_response_mask(batch)
+                    ori_batch.batch["response_mask"] = compute_response_mask(ori_batch)
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
                     # but might affect the loss calculation (due to the change of mini-batching).
                     # TODO: Decouple the DP balancing and mini-batching.
                     if self.config.trainer.balance_batch:
-                        self._balance_batch(batch, metrics=metrics)
+                        self._balance_batch(ori_batch, metrics=metrics)
 
                     # compute global_valid tokens
-                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                    ori_batch.meta_info["global_token_num"] = torch.sum(ori_batch.batch["attention_mask"], dim=-1).tolist()
 
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm:
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            batch = batch.union(reward_tensor)
+                            reward_tensor = self.rm_wg.compute_rm_score(ori_batch)
+                            ori_batch = ori_batch.union(reward_tensor)
 
                         if self.config.reward_model.launch_reward_fn_async:
-                            future_reward = compute_reward_async.remote(batch, self.config, self.tokenizer)
+                            future_reward = compute_reward_async.remote(ori_batch, self.config, self.tokenizer)
+                            batch = ori_batch
                         else:
-                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                            reward_tensor, reward_extra_infos_dict = compute_reward(ori_batch, self.reward_fn)
+                            ori_batch.batch["token_level_scores"] = reward_tensor
+                            # add group filtering strategy in rule-based reward
+                            if self.config.algorithm.filter_groups.enable:
+                                ori_batch.non_tensor_batch["seq_scores"] = ori_batch.batch["token_level_scores"].sum(dim=-1).numpy()
+
+                                uid2scores = defaultdict(list)
+                                for uid, score in zip(ori_batch.non_tensor_batch["uid"], ori_batch.non_tensor_batch["seq_scores"]):
+                                    uid2scores[uid].append(score)
+
+                                ori_batch.non_tensor_batch.pop("seq_scores")
+
+                                uid2std = {}
+                                for uid, scores in uid2scores.items():
+                                    uid2std[uid] = np.std(scores)
+
+                                kept_uids = {
+                                    uid
+                                    for uid, std_val in uid2std.items()
+                                    if std_val > 0 or len(uid2scores[uid]) == 1
+                                }
+                                num_prompts_in_batch += len(kept_uids)
+
+                                kept_traj_idxs = []
+                                for idx, uid in enumerate(ori_batch.non_tensor_batch["uid"]):
+                                    if uid in kept_uids:
+                                        kept_traj_idxs.append(idx)
+
+                                ori_batch = ori_batch[kept_traj_idxs]
+                                batch = ori_batch if batch is None else DataProto.concat([batch, ori_batch])
+
+                                train_bsz = self.config.data.train_batch_size
+                                if num_prompts_in_batch < train_bsz:
+                                    print(f"{num_prompts_in_batch=} < {train_bsz=}, keep generating...")
+                                    progress_bar.update(1)
+                                    continue
+                                else:
+                                    traj_bsz = train_bsz * self.config.actor_rollout_ref.rollout.n
+                                    batch = batch[:traj_bsz]
+                            else:
+                                batch = ori_batch
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
@@ -1112,7 +1158,7 @@ class RayPPOTrainer:
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                        batch.batch["token_level_scores"] = reward_tensor
+                            batch.batch["token_level_scores"] = reward_tensor
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
