@@ -853,7 +853,7 @@ distill:
     ulysses_sequence_parallel_size: ${actor_rollout_ref.actor.ulysses_sequence_parallel_size}
   ref:
     use_remove_padding: ${actor_rollout_ref.model.use_remove_padding}
-    use_fused_kernels: ${actor_rollout_ref.ref.use_fused_kernels}
+    use_fused_kernels: ${actor_rollout_ref.model.use_fused_kernels}
     ulysses_sequence_parallel_size: ${actor_rollout_ref.ref.ulysses_sequence_parallel_size}
     entropy_from_logits_with_chunking: ${actor_rollout_ref.ref.entropy_from_logits_with_chunking}
     use_torch_compile: ${actor_rollout_ref.ref.use_torch_compile}
