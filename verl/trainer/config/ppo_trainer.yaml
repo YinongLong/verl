@@ -905,6 +905,12 @@ algorithm:
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs in the entrypoint
   _target_: verl.trainer.config.AlgoConfig
 
+  filter_groups:
+
+    enable: False
+
+    max_num_gen_batches: -1
+
   # Discount factor for future rewards
   gamma: 1.0
 
