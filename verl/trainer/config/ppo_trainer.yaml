@@ -141,7 +141,7 @@ algorithm:
   _target_: verl.trainer.config.AlgoConfig
 
   filter_groups:
-    _target_: verl.trainer.config.KLControlConfig
+    _target_: verl.trainer.config.FilterGroupsConfig
 
     enable: False
 
