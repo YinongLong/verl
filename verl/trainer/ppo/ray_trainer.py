@@ -376,6 +376,7 @@ class RayPPOTrainer:
             AdvantageEstimator.RLOO,
             AdvantageEstimator.OPO,
             AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE,
+            AdvantageEstimator.MAGISTRAL,
             AdvantageEstimator.GPG,
         ]:
             self.use_critic = False
@@ -1107,6 +1108,11 @@ class RayPPOTrainer:
         last_val_metrics = None
         self.max_steps_duration = 0
 
+        # support dynamic sampling
+        acc_batch = None
+        num_prompts_in_acc_batch = 0
+        num_gen_batches = 0
+
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
@@ -1128,6 +1134,7 @@ class RayPPOTrainer:
                             self.rm_wg.start_profile()
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+                num_gen_batches += 1
 
                 # pop those keys for generation
                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
@@ -1210,27 +1217,76 @@ class RayPPOTrainer:
 
                         if self.config.reward_model.launch_reward_fn_async:
                             future_reward = compute_reward_async.remote(batch, self.config, self.tokenizer)
+                            wk_batch = batch
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                            batch.batch["token_level_scores"] = reward_tensor
+                            # add group filtering strategy in rule-based reward
+                            if self.config.algorithm.filter_groups.enable:
+                                batch.non_tensor_batch["seq_scores"] = batch.batch["token_level_scores"].sum(dim=-1).numpy()
+
+                                uid2scores = defaultdict(list)
+                                for uid, score in zip(batch.non_tensor_batch["uid"], batch.non_tensor_batch["seq_scores"]):
+                                    uid2scores[uid].append(score)
+
+                                batch.non_tensor_batch.pop("seq_scores")
+
+                                uid2std = {}
+                                for uid, scores in uid2scores.items():
+                                    uid2std[uid] = np.std(scores)
+
+                                kept_uids = {
+                                    uid
+                                    for uid, std_val in uid2std.items()
+                                    if std_val > 0 or len(uid2scores[uid]) == 1
+                                }
+                                num_prompts_in_acc_batch += len(kept_uids)
+
+                                if kept_uids:
+                                    kept_traj_idxs = []
+                                    for idx, uid in enumerate(batch.non_tensor_batch["uid"]):
+                                        if uid in kept_uids:
+                                            kept_traj_idxs.append(idx)
+
+                                    batch = batch[kept_traj_idxs]
+                                    acc_batch = batch if acc_batch is None else DataProto.concat([acc_batch, batch])
+
+                                train_bsz = self.config.data.train_batch_size
+                                if num_prompts_in_acc_batch < train_bsz:
+                                    print(f"{num_prompts_in_acc_batch=} < {train_bsz=}")
+                                    max_num_gen_batches = self.config.algorithm.filter_groups.max_num_gen_batches
+                                    if max_num_gen_batches < 0 or num_gen_batches < max_num_gen_batches:
+                                        print(f"{num_gen_batches=}. keep generating...")
+                                        progress_bar.update(1)
+                                        continue
+                                    else:
+                                        raise ValueError(f"{num_gen_batches=} >= {max_num_gen_batches=}." + " Generated too many. Please check if your data are too difficult." + " You could also try set max_num_gen_batches=0 to enable endless trials.")
+                                else:
+                                    traj_bsz = train_bsz * self.config.actor_rollout_ref.rollout.n
+                                    wk_batch = acc_batch[:traj_bsz]
+                                    acc_batch = acc_batch[traj_bsz:]
+                                    num_prompts_in_acc_batch -= train_bsz
+                            else:
+                                wk_batch = batch
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                        old_log_prob = self.actor_rollout_wg.compute_log_prob(wk_batch)
                         entropys = old_log_prob.batch["entropys"]
-                        response_masks = batch.batch["response_mask"]
+                        response_masks = wk_batch.batch["response_mask"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
                         entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
                         old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
                         metrics.update(old_log_prob_metrics)
                         old_log_prob.batch.pop("entropys")
-                        batch = batch.union(old_log_prob)
+                        wk_batch = wk_batch.union(old_log_prob)
 
-                        if "rollout_log_probs" in batch.batch.keys():
+                        if "rollout_log_probs" in wk_batch.batch.keys():
                             # TODO: we may want to add diff of probs too.
-                            rollout_old_log_probs = batch.batch["rollout_log_probs"]
-                            actor_old_log_probs = batch.batch["old_log_probs"]
-                            attention_mask = batch.batch["attention_mask"]
-                            responses = batch.batch["responses"]
+                            rollout_old_log_probs = wk_batch.batch["rollout_log_probs"]
+                            actor_old_log_probs = wk_batch.batch["old_log_probs"]
+                            attention_mask = wk_batch.batch["attention_mask"]
+                            responses = wk_batch.batch["responses"]
                             response_length = responses.size(1)
                             response_mask = attention_mask[:, -response_length:]
 
@@ -1253,35 +1309,35 @@ class RayPPOTrainer:
                         # compute reference log_prob
                         with marked_timer("ref", timing_raw, color="olive"):
                             if not self.ref_in_actor:
-                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(wk_batch)
                             else:
-                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
-                            batch = batch.union(ref_log_prob)
+                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(wk_batch)
+                            wk_batch = wk_batch.union(ref_log_prob)
 
                     # compute values
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):
-                            values = self.critic_wg.compute_values(batch)
-                            batch = batch.union(values)
+                            values = self.critic_wg.compute_values(wk_batch)
+                            wk_batch = wk_batch.union(values)
 
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                        batch.batch["token_level_scores"] = reward_tensor
+                            wk_batch.batch["token_level_scores"] = reward_tensor
 
                         if reward_extra_infos_dict:
-                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+                            wk_batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
-                            batch, kl_metrics = apply_kl_penalty(
-                                batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+                            wk_batch, kl_metrics = apply_kl_penalty(
+                                wk_batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
                             )
                             metrics.update(kl_metrics)
                         else:
-                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+                            wk_batch.batch["token_level_rewards"] = wk_batch.batch["token_level_scores"]
 
                         # compute advantages, executed on the driver process
 
@@ -1289,8 +1345,8 @@ class RayPPOTrainer:
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor
 
-                        batch = compute_advantage(
-                            batch,
+                        wk_batch = compute_advantage(
+                            wk_batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
                             gamma=self.config.algorithm.gamma,
                             lam=self.config.algorithm.lam,
@@ -1302,7 +1358,7 @@ class RayPPOTrainer:
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
-                            critic_output = self.critic_wg.update_critic(batch)
+                            critic_output = self.critic_wg.update_critic(wk_batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
 
@@ -1310,8 +1366,8 @@ class RayPPOTrainer:
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
-                            batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
+                            wk_batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                            actor_output = self.actor_rollout_wg.update_actor(wk_batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
@@ -1319,10 +1375,10 @@ class RayPPOTrainer:
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
                         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-                            print(batch.batch.keys())
-                            inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
-                            outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
-                            scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+                            print(wk_batch.batch.keys())
+                            inputs = self.tokenizer.batch_decode(wk_batch.batch["prompts"], skip_special_tokens=True)
+                            outputs = self.tokenizer.batch_decode(wk_batch.batch["responses"], skip_special_tokens=True)
+                            scores = wk_batch.batch["token_level_scores"].sum(-1).cpu().tolist()
                             self._dump_generations(
                                 inputs=inputs,
                                 outputs=outputs,
@@ -1386,15 +1442,18 @@ class RayPPOTrainer:
                     }
                 )
                 # collect metrics
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
-                metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                metrics.update(compute_data_metrics(batch=wk_batch, use_critic=self.use_critic))
+                metrics.update(compute_timing_metrics(batch=wk_batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
-                metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+                metrics.update(compute_throughout_metrics(batch=wk_batch, timing_raw=timing_raw, n_gpus=n_gpus))
 
                 # this is experimental and may be changed/removed in the future in favor of a general-purpose one
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
-                    self.train_dataloader.sampler.update(batch=batch)
+                    self.train_dataloader.sampler.update(batch=wk_batch)
+
+                metrics["training/num_gen_batches"] = num_gen_batches
+                num_gen_batches = 0
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
