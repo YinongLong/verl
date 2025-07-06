@@ -1111,6 +1111,7 @@ class RayPPOTrainer:
                 metrics = {}
                 timing_raw = {}
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+                num_gen_batches += 1
 
                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
 
@@ -1422,6 +1423,9 @@ class RayPPOTrainer:
 
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
                     self.train_dataloader.sampler.update(batch=wk_batch)
+
+                metrics["training/num_gen_batches"] = num_gen_batches
+                num_gen_batches = 0
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
