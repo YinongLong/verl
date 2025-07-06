@@ -1227,13 +1227,14 @@ class RayPPOTrainer:
                                 }
                                 num_prompts_in_acc_batch += len(kept_uids)
 
-                                kept_traj_idxs = []
-                                for idx, uid in enumerate(batch.non_tensor_batch["uid"]):
-                                    if uid in kept_uids:
-                                        kept_traj_idxs.append(idx)
+                                if kept_uids:
+                                    kept_traj_idxs = []
+                                    for idx, uid in enumerate(batch.non_tensor_batch["uid"]):
+                                        if uid in kept_uids:
+                                            kept_traj_idxs.append(idx)
 
-                                batch = batch[kept_traj_idxs]
-                                acc_batch = batch if acc_batch is None else DataProto.concat([acc_batch, batch])
+                                    batch = batch[kept_traj_idxs]
+                                    acc_batch = batch if acc_batch is None else DataProto.concat([acc_batch, batch])
 
                                 train_bsz = self.config.data.train_batch_size
                                 if num_prompts_in_acc_batch < train_bsz:
