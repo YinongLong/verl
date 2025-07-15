@@ -21,6 +21,9 @@ defaults:
   # Reference model will be enabled when actor.use_kl_loss or/and algorithm.use_kl_in_reward is/are True.
   - ref@actor_rollout_ref.ref: dp_ref
 
+  # Reference teacher model config
+  - teacher@teacher: dp_teacher
+
   # Rollout model config.
   - rollout@actor_rollout_ref.rollout: rollout
 

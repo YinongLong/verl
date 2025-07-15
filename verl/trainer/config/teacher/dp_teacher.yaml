@@ -1,0 +1,92 @@
+# defaults specify the default config from each component
+defaults:
+
+  # dp ref config, inheriting from trainer/config/ref/ref.yaml
+  - teacher
+
+  # load the reference default config, then apply the fields in the current yaml
+  - _self_
+
+# config for FSDP strategy
+fsdp_config:
+
+  # whether to offload parameters in FSDP
+  param_offload: False
+
+  # whether to perform reshard after model forward to save memory.
+  # only for fsdp2, [True, False, int between 1 and fsdp_size]
+  reshard_after_forward: True
+
+  # Only for FSDP1: FSDP1 configuration, prefetch the next forward-pass all-gather
+  # before the current forward computation.
+  forward_prefetch: False
+
+  # the wrap policy for FSDP model
+  wrap_policy:
+
+    # minimum number of params in a wrapped module
+    min_num_params: 0
+
+  # Number of GPUs in each FSDP shard group; -1 means auto
+  fsdp_size: -1
+
+# sequence parallel size
+# same as actor_rollout_ref.actor.ulysses_sequence_parallel_size if it exists, otherwise 1
+ulysses_sequence_parallel_size: ${oc.select:actor_rollout_ref.actor.ulysses_sequence_parallel_size,1}
+
+# calculate entropy with chunking to reduce memory peak
+entropy_from_logits_with_chunking: False
+
+# recompute entropy
+entropy_checkpointing: False
+
+# Additional Python packages to register huggingface models/tokenizers.
+external_lib: null
+
+# Used to override model's original configurations, mainly dropout
+override_config: {}
+
+# Whether to remove padding tokens in inputs during forward
+use_remove_padding: false
+
+# Whether to use shared memory (SHM) for accelerating the loading of model weights
+use_shm: false
+
+# Whether to use custom fused kernels (e.g., FlashAttention, fused MLP)
+use_fused_kernels: false
+
+# Huggingface model path. This can be either local path or HDFS path.
+model_path: ~/models/deepseek-llm-7b-chat
+
+# Whether to enable loading a remote code model
+trust_remote_code: false
+
+# Whether to use Liger for linear layer fusion
+use_liger: false
+
+# Custom chat template for the model.
+custom_chat_template: null
+
+# Options for fused kernels. If use_fused_kernels is true, this will be used.
+fused_kernel_options:
+
+  # Implementation backend for fused kernels. Options: "triton" or "torch".
+  impl_backend: torch
+
+# temperature
+temperature: 1.0
+
+# profiler configs
+profiler:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs in the entrypoint
+  _target_: verl.utils.profiler.ProfilerConfig
+
+  # True for each task has its own database, False for all tasks in one training step share one database.
+  discrete: False
+
+  # Whether to profile all ranks.
+  all_ranks: False
+
+  # The ranks that will be profiled. [] or [0,1,...]
+  ranks: []
