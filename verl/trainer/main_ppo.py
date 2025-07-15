@@ -198,7 +198,11 @@ class TaskRunner:
 
         # Add a reference policy worker if KL loss or KL reward is used.
         if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
-            role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
+            if config.teacher.enable:
+                from verl.workers.fsdp_workers import TeacherRefWorker
+                role_worker_mapping[Role.RefPolicy] = ray.remote(TeacherRefWorker)
+            else:
+                role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
             mapping[Role.RefPolicy] = global_pool_id
 
         # Load the reward manager for training and validation.

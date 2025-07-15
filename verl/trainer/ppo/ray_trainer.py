@@ -864,9 +864,13 @@ class RayPPOTrainer:
         # create reference policy if needed
         if self.use_reference_policy:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
+            if self.config.teacher.enable:
+                ref_config = self.config.teacher
+            else:
+                ref_config = self.config.actor_rollout_ref
             ref_policy_cls = RayClassWithInitArgs(
                 self.role_worker_mapping[Role.RefPolicy],
-                config=self.config.actor_rollout_ref,
+                config=ref_config,
                 role="ref",
                 profile_option=self.config.trainer.npu_profile.options,
             )
