@@ -1113,6 +1113,11 @@ class RayPPOTrainer:
         num_prompts_in_acc_batch = 0
         num_gen_batches = 0
 
+        # support dynamic sampling
+        acc_batch = None
+        num_prompts_in_acc_batch = 0
+        num_gen_batches = 0
+
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
