@@ -736,11 +736,7 @@ class DataProto:
         Returns:
             List[DataProto]: a list of DataProto after splitting
         """
-        assert len(self) % split_size == 0, (
-            f"only support equal split. Got size of DataProto {len(self)} and chunk {split_size}."
-        )
-        chunks = len(self) // split_size
-        return self.chunk(chunks)
+        return [self[i : i + split_size] for i in range(0, len(self), split_size)]
 
     @staticmethod
     def concat(data: list["DataProto"]) -> "DataProto":
@@ -903,6 +899,50 @@ class DataProto:
             non_tensor_batch=repeated_non_tensor_batch,
             meta_info=self.meta_info,
         )
+
+    def get_data_info(self) -> str:
+        """Return formatted information about stored data with nested type details.
+
+        Returns:
+            str: Formatted string showing tensor details and recursive metadata types
+        """
+        info = ["batch"]
+
+        for key, tensor in self.batch.items():
+            if hasattr(tensor, "shape") and hasattr(tensor, "dtype") and hasattr(tensor, "device"):
+                info.append(f"  {key}: {tuple(tensor.shape)} ({tensor.dtype}) {tensor.device}")
+            elif hasattr(tensor, "shape") and hasattr(tensor, "dtype"):
+                info.append(f"  {key}: {tuple(tensor.shape)} ({tensor.dtype})")
+            else:
+                info.append(f"  {key}: {type(tensor).__name__}")
+
+        info.append("non_tensor_batch")
+        for key, array in self.non_tensor_batch.items():
+            info.append(f"  {key}: ndarray{array.shape} ({array.dtype})")
+
+        info.append("meta_info")
+        for k, v in self.meta_info.items():
+            type_info = self._get_type_info(v)
+            info.append(f"  {k}: {type_info}")
+
+        return "\n".join(info)
+
+    def _get_type_info(self, value):
+        """Recursively get type information for nested structures"""
+        if isinstance(value, list):
+            elem_types = {self._get_type_info(v) for v in value[:3]}
+            return f"list[{'|'.join(elem_types) if elem_types else '...'}]"
+        if isinstance(value, tuple):
+            elem_types = [self._get_type_info(v) for v in value]
+            return f"tuple({', '.join(elem_types)})"
+        if isinstance(value, dict):
+            if not value:
+                return "dict"
+            k, v = next(iter(value.items()))
+            return f"dict[{self._get_type_info(k)}: {self._get_type_info(v)}]"
+        if isinstance(value, np.ndarray):
+            return f"ndarray{value.shape} ({value.dtype})"
+        return type(value).__name__
 
 
 @dataclass
