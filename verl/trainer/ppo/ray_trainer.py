@@ -1119,6 +1119,8 @@ class RayPPOTrainer:
                     non_tensor_batch_keys_to_pop.append("impt_score")
                 if "vice_gt_ids" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("vice_gt_ids")
+                if "vice_mode" in batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("vice_mode")
 
                 gen_batch = batch.pop(
                     batch_keys=batch_keys_to_pop,
@@ -1132,6 +1134,7 @@ class RayPPOTrainer:
                     vice_raw_prompt_ids = gen_batch.non_tensor_batch.pop("vice_raw_prompt_ids")
                     impt_score = gen_batch.non_tensor_batch.pop("impt_score")
                     vice_gt_ids = gen_batch.non_tensor_batch.pop("vice_gt_ids")
+                    vice_mode = gen_batch.non_tensor_batch.pop("vice_mode")
 
                     gt_ids = []
                     for i, score in enumerate(impt_score):
@@ -1145,6 +1148,7 @@ class RayPPOTrainer:
                         gen_batch.batch["position_ids"][i] = vice_position_ids[i]
                         gen_batch.non_tensor_batch["raw_prompt_ids"][i] = vice_raw_prompt_ids[i]
                         gt_ids[-1] = vice_gt_ids[i]
+                        batch.non_tensor_batch["extra_info"][i]["mode"] = vice_mode[i]
                     gen_batch.non_tensor_batch["gt_ids"] = np.array(gt_ids, dtype=object)
 
                 # pass global_steps to trace
