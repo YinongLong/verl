@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import random
 import uuid
 import warnings
 from collections import defaultdict
@@ -1106,14 +1107,67 @@ class RayPPOTrainer:
                 if "agent_name" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("agent_name")
 
+                if "vice_input_ids" in batch.batch:
+                    batch_keys_to_pop.append("vice_input_ids")
+                if "vice_attention_mask" in batch.batch:
+                    batch_keys_to_pop.append("vice_attention_mask")
+                if "vice_position_ids" in batch.batch:
+                    batch_keys_to_pop.append("vice_position_ids")
+                if "vice_raw_prompt_ids" in batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("vice_raw_prompt_ids")
+                if "impt_score" in batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("impt_score")
+                if "vice_gt_ids" in batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("vice_gt_ids")
+
                 gen_batch = batch.pop(
                     batch_keys=batch_keys_to_pop,
                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
                 )
 
+                if self.config.trainer.leakage_mode:
+                    vice_input_ids = gen_batch.batch.pop("vice_input_ids")
+                    vice_attention_mask = gen_batch.batch.pop("vice_attention_mask")
+                    vice_position_ids = gen_batch.batch.pop("vice_position_ids")
+                    vice_raw_prompt_ids = gen_batch.non_tensor_batch.pop("vice_raw_prompt_ids")
+                    impt_score = gen_batch.non_tensor_batch.pop("impt_score")
+                    vice_gt_ids = gen_batch.non_tensor_batch.pop("vice_gt_ids")
+
+                    gt_ids = []
+                    for i, score in enumerate(impt_score):
+                        gt_ids.append([])
+                        if score > self.config.trainer.leakage_thd:
+                            continue
+                        if random.random() > self.config.trainer.leakage_ratio:
+                            continue
+                        gen_batch.batch["input_ids"][i] = vice_input_ids[i]
+                        gen_batch.batch["attention_mask"][i] = vice_attention_mask[i]
+                        gen_batch.batch["position_ids"][i] = vice_position_ids[i]
+                        gen_batch.non_tensor_batch["raw_prompt_ids"][i] = vice_raw_prompt_ids[i]
+                        gt_ids[-1] = vice_gt_ids[i]
+                    gen_batch.non_tensor_batch["gt_ids"] = np.array(gt_ids, dtype=object)
+
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+
+                if self.config.trainer.leakage_mode:
+                    have_remained = False
+                    cnt_n = 0
+                    for i in range(len(gen_batch)):
+                        cnt_n += 1
+                        if not gen_batch.non_tensor_batch["gt_ids"][i]:
+                            have_remained = False
+                            cnt_n = cnt_n % self.config.actor_rollout_ref.rollout.n
+                            continue
+
+                        if have_remained:
+                            gen_batch.non_tensor_batch["gt_ids"][i] = []
+                        else:
+                            have_remained = True
+                        cnt_n = cnt_n % self.config.actor_rollout_ref.rollout.n
+                        if cnt_n == 0:
+                            have_remained = False
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
