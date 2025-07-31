@@ -233,7 +233,7 @@ class CCSRLHFDataset(Dataset):
         row_dict['vice_gt_ids'] = vice_gt_ids
 
         # add index for each prompt
-        impt_score = row_dict.get("extra_info", {}).get("impt_score", 1.0)
+        impt_score = row_dict.get("extra_info", {}).get("impt_score", 0.0)
         index = row_dict.get("extra_info", {}).get("index", 0)
         tools_kwargs = row_dict.get("extra_info", {}).get("tools_kwargs", {})
         interaction_kwargs = row_dict.get("extra_info", {}).get("interaction_kwargs", {})

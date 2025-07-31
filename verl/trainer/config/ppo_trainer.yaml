@@ -202,7 +202,7 @@ trainer:
   leakage_mode: False
 
   # the threshold for leakage mode
-  leakage_thd: 0.9
+  leakage_thd: 0.1
 
   # the ratio for leakage mode
   leakage_ratio: 0.5
