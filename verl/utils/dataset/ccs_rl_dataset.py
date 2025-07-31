@@ -17,7 +17,6 @@
 import copy
 import logging
 import os
-import re
 from collections import defaultdict
 from typing import Optional
 
@@ -229,6 +228,7 @@ class CCSRLHFDataset(Dataset):
         self._proc_messages(row_dict, vice_messages, var_prefix='vice_')
 
         # add index for each prompt
+        impt_score = row_dict.get("extra_info", {}).get("impt_score", 1.0)
         index = row_dict.get("extra_info", {}).get("index", 0)
         tools_kwargs = row_dict.get("extra_info", {}).get("tools_kwargs", {})
         interaction_kwargs = row_dict.get("extra_info", {}).get("interaction_kwargs", {})
@@ -236,6 +236,7 @@ class CCSRLHFDataset(Dataset):
         if need_tools_kwargs and not tools_kwargs:
             logger.warning("tools_kwargs is empty for index {}, data source: {}", index, row_dict["data_source"])
 
+        row_dict["impt_score"] = impt_score
         row_dict["index"] = index
         row_dict["tools_kwargs"] = tools_kwargs
         row_dict["interaction_kwargs"] = interaction_kwargs
