@@ -227,6 +227,11 @@ class CCSRLHFDataset(Dataset):
         self._proc_messages(row_dict, messages, var_prefix='')
         self._proc_messages(row_dict, vice_messages, var_prefix='vice_')
 
+        vice_ground_truth = row_dict.pop('vice_ground_truth')
+        vice_gt_ids = self.tokenizer.encode(vice_ground_truth, add_special_tokens=False)
+        vice_gt_ids.append(self.tokenizer.eos_token_id)
+        row_dict['vice_gt_ids'] = vice_gt_ids
+
         # add index for each prompt
         impt_score = row_dict.get("extra_info", {}).get("impt_score", 1.0)
         index = row_dict.get("extra_info", {}).get("index", 0)
