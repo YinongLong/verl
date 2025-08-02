@@ -1269,7 +1269,7 @@ class RayPPOTrainer:
                                     acc_batch = batch if acc_batch is None else DataProto.concat([acc_batch, batch])
 
                                 train_bsz = self.config.data.train_batch_size
-                                if num_prompts_in_acc_batch < train_bsz:
+                                if (num_prompts_in_acc_batch < train_bsz) and (not is_last_step):
                                     print(f"{num_prompts_in_acc_batch=} < {train_bsz=}")
                                     max_num_gen_batches = self.config.algorithm.filter_groups.max_num_gen_batches
                                     if max_num_gen_batches < 0 or num_gen_batches < max_num_gen_batches:
