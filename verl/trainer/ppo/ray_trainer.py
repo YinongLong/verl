@@ -1074,6 +1074,7 @@ class RayPPOTrainer:
         acc_batch = None
         num_prompts_in_acc_batch = 0
         num_gen_batches = 0
+        num_sampled_batches = 0
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -1090,6 +1091,7 @@ class RayPPOTrainer:
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 num_gen_batches += 1
+                num_sampled_batches += 1
 
                 # pop those keys for generation
                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
@@ -1173,7 +1175,7 @@ class RayPPOTrainer:
                         if cnt_n == 0:
                             have_remained = False
 
-                is_last_step = self.global_steps >= self.total_training_steps
+                is_last_step = num_sampled_batches >= self.total_training_steps
 
                 with marked_timer("step", timing_raw):
                     # generate a batch
