@@ -15,6 +15,5 @@
 from .rl_dataset import RLHFDataset
 from .rm_dataset import RMDataset
 from .sft_dataset import SFTDataset
-from .ccs_rl_dataset import CCSRLHFDataset
 
-__all__ = ["RLHFDataset", "RMDataset", "SFTDataset", "CCSRLHFDataset"]
+__all__ = ["RLHFDataset", "RMDataset", "SFTDataset"]

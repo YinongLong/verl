@@ -20,7 +20,6 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
-import random
 import uuid
 import warnings
 from collections import defaultdict

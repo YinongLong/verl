@@ -201,15 +201,6 @@ algorithm:
 # config for the trainer
 trainer:
 
-  # whether to use leakage training mode
-  leakage_mode: False
-
-  # the threshold for leakage mode
-  leakage_thd: 0.1
-
-  # the ratio for leakage mode
-  leakage_ratio: 0.5
-
   # Whether to balance batch sizes across distributed workers
   balance_batch: True
 
