@@ -310,8 +310,9 @@ def compute_grpo_outcome_advantage(
                 id2mean[idx] = torch.tensor(0.0)
                 id2std[idx] = torch.tensor(1.0)
             elif len(id2score[idx]) > 1:
-                id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
-                id2std[idx] = torch.std(torch.tensor([id2score[idx]]))
+                scores_tensor = torch.stack(id2score[idx])
+                id2mean[idx] = torch.mean(scores_tensor)
+                id2std[idx] = torch.std(scores_tensor)
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
         for i in range(bsz):
@@ -474,7 +475,7 @@ def compute_reinforce_plus_plus_baseline_outcome_advantage(
             if len(id2score[idx]) == 1:
                 id2mean[idx] = torch.tensor(0.0)
             elif len(id2score[idx]) > 1:
-                id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
+                id2mean[idx] = torch.mean(torch.stack(id2score[idx]))
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
         for i in range(bsz):
@@ -524,7 +525,7 @@ def compute_rloo_outcome_advantage(
             if len(id2score[idx]) == 1:
                 id2mean[idx] = torch.tensor(0.0)
             elif len(id2score[idx]) > 1:
-                id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
+                id2mean[idx] = torch.mean(torch.stack(id2score[idx]))
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
         for i in range(bsz):
@@ -580,8 +581,8 @@ def compute_opo_outcome_advantage(
             if len(id2score[idx]) == 1:
                 id2bsl[idx] = torch.tensor(0.0)
             elif len(id2score[idx]) > 1:
-                score_tensor = torch.tensor(id2score[idx])
-                len_tensor = torch.tensor(id2len[idx])
+                score_tensor = torch.stack(id2score[idx])
+                len_tensor = torch.stack(id2len[idx])
                 id2bsl[idx] = (len_tensor * score_tensor).sum() / len_tensor.sum()
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
@@ -718,8 +719,9 @@ def compute_gpg_outcome_advantage(
                 id2mean[idx] = torch.tensor(0.0)
                 id2std[idx] = torch.tensor(1.0)
             elif len(id2score[idx]) > 1:
-                id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
-                id2std[idx] = torch.std(torch.tensor([id2score[idx]]))
+                scores_tensor = torch.stack(id2score[idx])
+                id2mean[idx] = torch.mean(scores_tensor)
+                id2std[idx] = torch.std(scores_tensor)
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
         for i in range(bsz):

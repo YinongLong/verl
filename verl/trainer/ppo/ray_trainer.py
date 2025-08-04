@@ -161,7 +161,6 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
         data (DataProto): The data containing batched model outputs and inputs.
         kl_ctrl (core_algos.AdaptiveKLController): Controller for adaptive KL penalty.
         kl_penalty (str, optional): Type of KL penalty to apply. Defaults to "kl".
-        multi_turn (bool, optional): Whether the data is from a multi-turn conversation. Defaults to False.
 
     Returns:
         tuple: A tuple containing:
@@ -574,7 +573,7 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _dump_generations(self, inputs, outputs, scores, reward_extra_infos_dict, dump_path):
+    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
@@ -583,6 +582,7 @@ class RayPPOTrainer:
         base_data = {
             "input": inputs,
             "output": outputs,
+            "gts": gts,
             "score": scores,
             "step": [self.global_steps] * n,
         }
@@ -632,6 +632,7 @@ class RayPPOTrainer:
         # Lists to collect samples for the table
         sample_inputs = []
         sample_outputs = []
+        sample_gts = []
         sample_scores = []
         sample_turns = []
 
@@ -652,6 +653,11 @@ class RayPPOTrainer:
             # TODO: Can we keep special tokens except for padding tokens?
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
+
+            ground_truths = [
+                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
+            ]
+            sample_gts.extend(ground_truths)
 
             batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
             non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
@@ -734,6 +740,7 @@ class RayPPOTrainer:
             self._dump_generations(
                 inputs=sample_inputs,
                 outputs=sample_outputs,
+                gts=sample_gts,
                 scores=sample_scores,
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=val_data_dir,
@@ -1076,22 +1083,34 @@ class RayPPOTrainer:
         num_gen_batches = 0
         num_sampled_batches = 0
 
+        prev_step_profile = False
+        curr_step_profile = (
+            self.global_steps in self.config.trainer.profile_steps
+            if self.config.trainer.profile_steps is not None
+            else False
+        )
+        next_step_profile = False
+
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
 
-                do_profile = (
-                    self.global_steps in self.config.trainer.profile_steps
-                    if self.config.trainer.profile_steps is not None
-                    else False
-                )
                 with marked_timer("start_profile", timing_raw):
-                    self._start_profiling(do_profile)
+                    self._start_profiling(
+                        not prev_step_profile and curr_step_profile
+                        if self.config.trainer.profile_continuous_steps
+                        else curr_step_profile
+                    )
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 num_gen_batches += 1
                 num_sampled_batches += 1
+
+                # add uid to batch
+                batch.non_tensor_batch["uid"] = np.array(
+                    [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                )
 
                 # pop those keys for generation
                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
@@ -1109,71 +1128,14 @@ class RayPPOTrainer:
                 if "agent_name" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("agent_name")
 
-                if "vice_input_ids" in batch.batch:
-                    batch_keys_to_pop.append("vice_input_ids")
-                if "vice_attention_mask" in batch.batch:
-                    batch_keys_to_pop.append("vice_attention_mask")
-                if "vice_position_ids" in batch.batch:
-                    batch_keys_to_pop.append("vice_position_ids")
-                if "vice_raw_prompt_ids" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("vice_raw_prompt_ids")
-                if "impt_score" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("impt_score")
-                if "vice_gt_ids" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("vice_gt_ids")
-                if "vice_mode" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("vice_mode")
-
                 gen_batch = batch.pop(
                     batch_keys=batch_keys_to_pop,
                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
                 )
 
-                if self.config.trainer.leakage_mode:
-                    vice_input_ids = gen_batch.batch.pop("vice_input_ids")
-                    vice_attention_mask = gen_batch.batch.pop("vice_attention_mask")
-                    vice_position_ids = gen_batch.batch.pop("vice_position_ids")
-                    vice_raw_prompt_ids = gen_batch.non_tensor_batch.pop("vice_raw_prompt_ids")
-                    impt_score = gen_batch.non_tensor_batch.pop("impt_score")
-                    vice_gt_ids = gen_batch.non_tensor_batch.pop("vice_gt_ids")
-                    vice_mode = gen_batch.non_tensor_batch.pop("vice_mode")
-
-                    gt_ids = []
-                    for i, score in enumerate(impt_score):
-                        gt_ids.append([])
-                        if score > self.config.trainer.leakage_thd:
-                            continue
-                        if random.random() > self.config.trainer.leakage_ratio:
-                            continue
-                        gen_batch.batch["input_ids"][i] = vice_input_ids[i]
-                        gen_batch.batch["attention_mask"][i] = vice_attention_mask[i]
-                        gen_batch.batch["position_ids"][i] = vice_position_ids[i]
-                        gen_batch.non_tensor_batch["raw_prompt_ids"][i] = vice_raw_prompt_ids[i]
-                        gt_ids[-1] = vice_gt_ids[i]
-                        batch.non_tensor_batch["extra_info"][i]["mode"] = vice_mode[i]
-                    gen_batch.non_tensor_batch["gt_ids"] = np.array(gt_ids, dtype=object)
-
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-
-                if self.config.trainer.leakage_mode:
-                    have_remained = False
-                    cnt_n = 0
-                    for i in range(len(gen_batch)):
-                        cnt_n += 1
-                        if not gen_batch.non_tensor_batch["gt_ids"][i]:
-                            have_remained = False
-                            cnt_n = cnt_n % self.config.actor_rollout_ref.rollout.n
-                            continue
-
-                        if have_remained:
-                            gen_batch.non_tensor_batch["gt_ids"][i] = []
-                        else:
-                            have_remained = True
-                        cnt_n = cnt_n % self.config.actor_rollout_ref.rollout.n
-                        if cnt_n == 0:
-                            have_remained = False
 
                 is_last_step = num_sampled_batches >= self.total_training_steps
 
@@ -1208,9 +1170,6 @@ class RayPPOTrainer:
 
                             del gen_baseline_batch, gen_baseline_output
 
-                    batch.non_tensor_batch["uid"] = np.array(
-                        [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
-                    )
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
@@ -1397,14 +1356,21 @@ class RayPPOTrainer:
                             inputs = self.tokenizer.batch_decode(wk_batch.batch["prompts"], skip_special_tokens=True)
                             outputs = self.tokenizer.batch_decode(wk_batch.batch["responses"], skip_special_tokens=True)
                             scores = wk_batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+                            sample_gts = [
+                                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None)
+                                for item in wk_batch
+                            ]
+
                             if "request_id" in wk_batch.non_tensor_batch:
                                 reward_extra_infos_dict.setdefault(
                                     "request_id",
                                     wk_batch.non_tensor_batch["request_id"].tolist(),
                                 )
+
                             self._dump_generations(
                                 inputs=inputs,
                                 outputs=outputs,
+                                gts=sample_gts,
                                 scores=scores,
                                 reward_extra_infos_dict=reward_extra_infos_dict,
                                 dump_path=rollout_data_dir,
@@ -1445,7 +1411,18 @@ class RayPPOTrainer:
                             self._save_checkpoint()
 
                 with marked_timer("stop_profile", timing_raw):
-                    self._stop_profiling(do_profile)
+                    next_step_profile = (
+                        self.global_steps + 1 in self.config.trainer.profile_steps
+                        if self.config.trainer.profile_steps is not None
+                        else False
+                    )
+                    self._stop_profiling(
+                        curr_step_profile and not next_step_profile
+                        if self.config.trainer.profile_continuous_steps
+                        else curr_step_profile
+                    )
+                    prev_step_profile = curr_step_profile
+                    curr_step_profile = next_step_profile
 
                 steps_duration = timing_raw["step"]
                 self.max_steps_duration = max(self.max_steps_duration, steps_duration)
@@ -1486,4 +1463,4 @@ class RayPPOTrainer:
                 # in favor of a general-purpose data buffer pool
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
-                    self.train_dataset.on_batch_end(batch=batch)
+                    self.train_dataset.on_batch_end(batch=wk_batch)

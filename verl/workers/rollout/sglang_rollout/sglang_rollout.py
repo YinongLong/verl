@@ -22,7 +22,7 @@ import os
 import time
 from copy import deepcopy
 from json import JSONDecodeError
-from typing import Any, List, Optional, Tuple
+from typing import Any, Optional
 from uuid import uuid4
 
 import numpy as np
@@ -38,7 +38,6 @@ from sglang.srt.managers.tokenizer_manager import (
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
-    MultiprocessingSerializer,
     assert_pkg_version,
     get_ip,
     get_open_port,
@@ -165,22 +164,8 @@ class AsyncEngine(sglang.srt.entrypoints.engine.Engine):
             obj = ResumeMemoryOccupationReqInput(tags=tags)
         return await self.tokenizer_manager.resume_memory_occupation(obj, None)
 
-    async def update_weights_from_tensor(
-        self,
-        named_tensors: List[Tuple[str, torch.Tensor]],  # noqa: UP006
-        load_format: Optional[str] = None,
-        flush_cache: bool = True,
-    ):
-        """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
-        to avoid duplicated cache cleaning operation."""
-        obj = UpdateWeightsFromTensorReqInput(
-            serialized_named_tensors=[
-                MultiprocessingSerializer.serialize(named_tensors) for _ in range(self.server_args.tp_size)
-            ],
-            load_format=load_format,
-            flush_cache=flush_cache,
-        )
-        return await self.tokenizer_manager.update_weights_from_tensor(obj, None)
+    async def update_weights_from_tensor(self, update_weights_request: UpdateWeightsFromTensorReqInput):
+        return await self.tokenizer_manager.update_weights_from_tensor(update_weights_request, None)
 
     async def flush_cache(self):
         return await self.tokenizer_manager.flush_cache()
@@ -438,7 +423,8 @@ class SGLangRollout(BaseRollout):
         tp_size_per_node = self._tp_size // nnodes
         node_rank = self._tp_rank // tp_size_per_node
         first_rank_in_node = self._tp_rank % tp_size_per_node == 0
-        attention_backend = self.config.engine_kwargs.sglang.attention_backend
+        engine_kwargs = self.config.get("engine_kwargs", {}).get("sglang", {})
+        attention_backend = engine_kwargs.get("attention_backend", None)
 
         if first_rank_in_node:
             rank = dist.get_rank()
@@ -1041,7 +1027,10 @@ class SGLangRollout(BaseRollout):
                 tool = self._tool_map[tool_schema.function.name]
                 create_kwargs = _req.tools_kwargs[tool.name].get("create_kwargs", {})
                 tool_creation_coroutines.append(tool.create(_req.request_id, **create_kwargs))
-            await asyncio.gather(*tool_creation_coroutines)
+            tool_creation_results = await asyncio.gather(*tool_creation_coroutines)
+            _req.add_tool_response_messages(
+                self.processing_class, [tool_result for _, tool_result in tool_creation_results]
+            )
         if _req.interaction_kwargs and self.interaction_map:
             interaction_kwargs = _req.interaction_kwargs
             # Get interaction by name from interaction_kwargs
