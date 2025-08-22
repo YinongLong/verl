@@ -1146,6 +1146,7 @@ class RayPPOTrainer:
                         gen_batch.non_tensor_batch["gt_tokens"] = []
                 else:
                     gen_batch.non_tensor_batch.pop("gt_tokens", None)
+                    gen_batch.non_tensor_batch.pop("digest", None)
 
                 with marked_timer("step", timing_raw):
                     # generate a batch
