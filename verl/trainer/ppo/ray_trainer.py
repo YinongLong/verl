@@ -1143,7 +1143,7 @@ class RayPPOTrainer:
                     for idx in range(len(gen_batch)):
                         if idx in chosen_pos_set:
                             continue
-                        gen_batch.non_tensor_batch["gt_tokens"] = []
+                        gen_batch.non_tensor_batch["gt_tokens"][idx] = []
                 else:
                     gen_batch.non_tensor_batch.pop("gt_tokens", None)
                     gen_batch.non_tensor_batch.pop("digest", None)
