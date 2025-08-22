@@ -117,6 +117,7 @@ class RLHFDataset(Dataset):
         self.filter_prompts = config.get("filter_prompts", True)
         self.serialize_dataset = False
         self.return_multi_modal_inputs = config.get("return_multi_modal_inputs", True)
+        self.add_gt_tokens = config.get("add_gt_tokens", False)
 
         self._download()
         self._read_files_and_tokenize()
@@ -316,6 +317,13 @@ class RLHFDataset(Dataset):
                 raise RuntimeError(f"Prompt length {len(raw_prompt_ids)} is longer than {self.max_prompt_length}.")
 
         row_dict["raw_prompt_ids"] = raw_prompt_ids
+
+        if self.add_gt_tokens:
+            gt_response = row_dict["reward_model"]["ground_truth"]
+            gt_tokens = self.tokenizer.encode(gt_response, add_special_tokens=False)
+            gt_tokens.append(self.tokenizer.eos_token_id)
+            row_dict["gt_tokens"] = gt_tokens
+
         # encode prompts without chat template
         if self.return_raw_chat:
             row_dict["raw_prompt"] = messages
