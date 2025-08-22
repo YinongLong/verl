@@ -650,6 +650,13 @@ class SGLangRollout(BaseRollout):
                 dtype=object,
             )
 
+        index2gt_ids = {}
+        if "gt_tokens" in non_tensor_batch:
+            for i in range(batch_size):
+                if not non_tensor_batch["gt_tokens"][i]:
+                    continue
+                index2gt_ids[i] = non_tensor_batch["gt_tokens"][i]
+
         if "multi_modal_data" in non_tensor_batch:
             sglang_inputs = []
             for raw_prompt_ids, multi_modal_data in zip(
@@ -756,6 +763,13 @@ class SGLangRollout(BaseRollout):
                     rollout_log_probs, self.config.response_length, self.pad_token_id
                 )
 
+        if index2gt_ids:
+            for i, gt_ids in index2gt_ids.items():
+                num_ids = len(gt_ids)
+                response[i, :num_ids] = torch.tensor(gt_ids, dtype=response.dtype, device=response.device)
+                response[i, num_ids:] = self.pad_token_id
+            rollout_log_probs = None
+
         seq = torch.cat([idx, response], dim=-1)
 
         response_length = response.size(1)
@@ -786,7 +800,7 @@ class SGLangRollout(BaseRollout):
             },
             batch_size=batch_size,
         )
-        if self.config.calculate_log_probs:
+        if self.config.calculate_log_probs and rollout_log_probs is not None:
             # we will recompute old log prob with actor
             batch["rollout_log_probs"] = rollout_log_probs
 

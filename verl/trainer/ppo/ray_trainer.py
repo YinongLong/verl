@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import random
 import uuid
 import warnings
 from collections import defaultdict
@@ -1125,6 +1126,23 @@ class RayPPOTrainer:
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
 
                 is_last_step = num_sampled_batches >= self.total_training_steps
+
+                if self.config.trainer.use_leakage_mode:
+                    pprint('[Leakage Model] +++++++ choosing ground truth +++++++')
+                    batch_digest = gen_batch.non_tensor_batch.pop("digest")
+                    digest2pos = defaultdict(list)
+                    for idx, digest in enumerate(batch_digest):
+                        digest2pos[digest].append(idx)
+                    chosen_pos_set = set()
+                    for _, pos_arr in digest2pos.items():
+                        chosen_pos = random.choice(pos_arr)
+                        chosen_pos_set.add(chosen_pos)
+                    for idx in range(len(gen_batch)):
+                        if idx in chosen_pos_set:
+                            continue
+                        gen_batch.non_tensor_batch["gt_tokens"] = []
+                else:
+                    gen_batch.non_tensor_batch.pop("gt_tokens", None)
 
                 with marked_timer("step", timing_raw):
                     # generate a batch

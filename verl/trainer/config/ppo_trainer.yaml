@@ -183,6 +183,9 @@ algorithm:
 # config for the trainer
 trainer:
 
+  # Whether to use leakage training mode
+  use_leakage_mode: False
+
   # Whether to balance batch sizes across distributed workers
   balance_batch: True
 
