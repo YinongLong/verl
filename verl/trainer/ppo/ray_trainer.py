@@ -680,6 +680,9 @@ class RayPPOTrainer:
             sample_gts.extend(ground_truths)
 
             test_gen_batch = self._get_gen_batch(test_batch)
+            test_gen_batch.non_tensor_batch.pop("gt_tokens", None)
+            test_gen_batch.non_tensor_batch.pop("digest", None)
+
             test_gen_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "pad_token_id": self.tokenizer.pad_token_id,
