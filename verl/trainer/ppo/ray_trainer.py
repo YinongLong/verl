@@ -1241,8 +1241,8 @@ class RayPPOTrainer:
 
                                 batch.non_tensor_batch.pop("seq_scores")
 
-                                good_uids = {}
-                                bad_uids = {}
+                                good_uids = set()
+                                bad_uids = set()
                                 for uid, scores in uid2scores.items():
                                     assert len(scores) > 1
                                     score_std = np.std(scores)
@@ -1250,6 +1250,7 @@ class RayPPOTrainer:
                                         good_uids.add(uid)
                                     else:
                                         bad_uids.add(uid)
+
                                 good_traj_idxs = []
                                 for idx, uid in enumerate(batch.non_tensor_batch["uid"]):
                                     if uid in good_uids:
