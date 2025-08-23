@@ -17,7 +17,8 @@
 PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
-
+import collections
+import copy
 import json
 import os
 import random
@@ -290,6 +291,28 @@ def compute_advantage(
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
     return data
+
+
+def get_bad2good_uid_counter(good_uids, bad_uids):
+    assert isinstance(good_uids, set) and good_uids
+    assert isinstance(bad_uids, set) and bad_uids
+    good_uids = list(good_uids)
+    bad_uids = list(bad_uids)
+
+    num_bad_uids = len(bad_uids)
+    num_good_uids = len(good_uids)
+
+    uid_counter = collections.Counter()
+    if num_good_uids >= num_bad_uids:
+        perm = torch.randperm(num_good_uids)
+        for g_i in perm[:num_bad_uids]:
+            uid_counter[good_uids[g_i]] += 1
+    else:
+        indices = torch.randint(low=0, high=num_good_uids, size=(num_bad_uids,))
+        for g_i in indices:
+            uid_counter[good_uids[g_i]] += 1
+
+    return uid_counter
 
 
 class RayPPOTrainer:
@@ -1131,7 +1154,7 @@ class RayPPOTrainer:
                 is_last_step = num_sampled_batches >= self.total_training_steps
 
                 if self.config.trainer.use_leakage_mode:
-                    pprint('[Leakage Model] +++++++ choosing ground truth +++++++')
+                    pprint('[Leakage Mode] +++++++ choosing ground truth +++++++')
                     batch_digest = gen_batch.non_tensor_batch.pop("digest")
                     digest2pos = defaultdict(list)
                     for idx, digest in enumerate(batch_digest):
@@ -1218,41 +1241,64 @@ class RayPPOTrainer:
 
                                 batch.non_tensor_batch.pop("seq_scores")
 
-                                uid2std = {}
+                                good_uids = {}
+                                bad_uids = {}
                                 for uid, scores in uid2scores.items():
-                                    uid2std[uid] = np.std(scores)
+                                    assert len(scores) > 1
+                                    score_std = np.std(scores)
+                                    if score_std > 0:
+                                        good_uids.add(uid)
+                                    else:
+                                        bad_uids.add(uid)
+                                good_traj_idxs = []
+                                for idx, uid in enumerate(batch.non_tensor_batch["uid"]):
+                                    if uid in good_uids:
+                                        good_traj_idxs.append(idx)
 
-                                kept_uids = {
-                                    uid
-                                    for uid, std_val in uid2std.items()
-                                    if std_val > 0 or len(uid2scores[uid]) == 1
-                                }
-                                num_prompts_in_acc_batch += len(kept_uids)
+                                if self.config.algorithm.filter_groups.filter_type == 'DAPO':
+                                    num_prompts_in_acc_batch += len(good_uids)
+                                    if good_traj_idxs:
+                                        batch = batch.select_idxs(good_traj_idxs)
+                                        acc_batch = batch if acc_batch is None else DataProto.concat([acc_batch, batch])
 
-                                if kept_uids:
-                                    kept_traj_idxs = []
-                                    for idx, uid in enumerate(batch.non_tensor_batch["uid"]):
-                                        if uid in kept_uids:
-                                            kept_traj_idxs.append(idx)
-
-                                    batch = batch[kept_traj_idxs]
-                                    acc_batch = batch if acc_batch is None else DataProto.concat([acc_batch, batch])
-
-                                train_bsz = self.config.data.train_batch_size
-                                if (num_prompts_in_acc_batch < train_bsz) and (not is_last_step):
-                                    print(f"{num_prompts_in_acc_batch=} < {train_bsz=}")
-                                    max_num_gen_batches = self.config.algorithm.filter_groups.max_num_gen_batches
-                                    if max_num_gen_batches < 0 or num_gen_batches < max_num_gen_batches:
-                                        print(f"{num_gen_batches=}. keep generating...")
+                                    train_bsz = self.config.data.train_batch_size
+                                    if (num_prompts_in_acc_batch < train_bsz) and (not is_last_step):
+                                        pprint(f"{num_prompts_in_acc_batch=} < {train_bsz=}")
+                                        max_num_gen_batches = self.config.algorithm.filter_groups.max_num_gen_batches
+                                        if max_num_gen_batches <= 0 or num_gen_batches < max_num_gen_batches:
+                                            pprint(f"{num_gen_batches=}. keep generating...")
+                                            progress_bar.update(1)
+                                            continue
+                                        else:
+                                            raise ValueError(f"{num_gen_batches=} >= {max_num_gen_batches=}." + " Generated too many. Please check if your data are too difficult." + " You could also try set max_num_gen_batches=0 to enable endless trials.")
+                                    else:
+                                        traj_bsz = train_bsz * self.config.actor_rollout_ref.rollout.n
+                                        wk_batch = acc_batch[:traj_bsz]
+                                        acc_batch = acc_batch[traj_bsz:]
+                                        num_prompts_in_acc_batch -= train_bsz
+                                elif self.config.algorithm.filter_groups.filter_type == 'POLARIS':
+                                    if not good_uids:
+                                        pprint('cannot find informative samples. keep generating...')
                                         progress_bar.update(1)
                                         continue
+                                    elif not bad_uids:
+                                        wk_batch = batch
                                     else:
-                                        raise ValueError(f"{num_gen_batches=} >= {max_num_gen_batches=}." + " Generated too many. Please check if your data are too difficult." + " You could also try set max_num_gen_batches=0 to enable endless trials.")
+                                        good_batch = batch.select_idxs(good_traj_idxs)
+                                        guid_counter = get_bad2good_uid_counter(good_uids, bad_uids)
+
+                                        guid2arr = collections.defaultdict(list)
+                                        for idx, uid in enumerate(batch.non_tensor_batch["uid"]):
+                                            if uid in guid_counter:
+                                                guid2arr[uid].append(idx)
+                                        repl_idxs = []
+                                        for guid, cnt in guid_counter.items():
+                                            g_idxs = copy.deepcopy(guid2arr[guid]) * cnt
+                                            repl_idxs.extend(g_idxs)
+                                        repl_batch = batch.select_idxs(repl_idxs)
+                                        wk_batch = DataProto.concat([good_batch, repl_batch])
                                 else:
-                                    traj_bsz = train_bsz * self.config.actor_rollout_ref.rollout.n
-                                    wk_batch = acc_batch[:traj_bsz]
-                                    acc_batch = acc_batch[traj_bsz:]
-                                    num_prompts_in_acc_batch -= train_bsz
+                                    raise ValueError('This dynamic sampling mechanism is not supported!!!')
                             else:
                                 wk_batch = batch
 

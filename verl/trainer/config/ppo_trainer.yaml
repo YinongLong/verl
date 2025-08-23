@@ -128,9 +128,17 @@ algorithm:
   filter_groups:
     _target_: verl.trainer.config.FilterGroupsConfig
 
+    # Whether to enable filter groups
     enable: False
 
-    max_num_gen_batches: -1
+    # Non-positive values mean no upper limit
+    max_num_gen_batches: 0
+
+    # 'DAPO' or 'POLARIS'
+    filter_type: DAPO
+
+    # Whether to open debug mode
+    debug_mode: False
 
   # Discount factor for future rewards
   gamma: 1.0
