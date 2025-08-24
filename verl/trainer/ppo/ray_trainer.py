@@ -1292,11 +1292,20 @@ class RayPPOTrainer:
                                         for idx, uid in enumerate(batch.non_tensor_batch["uid"]):
                                             if uid in guid_counter:
                                                 guid2arr[uid].append(idx)
+
                                         repl_idxs = []
+                                        repl_uids = []
                                         for guid, cnt in guid_counter.items():
-                                            g_idxs = copy.deepcopy(guid2arr[guid]) * cnt
-                                            repl_idxs.extend(g_idxs)
+                                            g_idxs = copy.deepcopy(guid2arr[guid])
+                                            for _ in cnt:
+                                                repl_idxs.extend(g_idxs)
+                                                new_uid = str(uuid.uuid4())
+                                                repl_uids.extend([new_uid, ] * len(g_idxs))
+
                                         repl_batch = batch.select_idxs(repl_idxs)
+                                        assert len(repl_batch) == len(repl_uids)
+                                        for i in range(len(repl_uids)):
+                                            repl_batch.non_tensor_batch["uid"] = repl_uids[i]
                                         wk_batch = DataProto.concat([good_batch, repl_batch])
                                 else:
                                     raise ValueError('This dynamic sampling mechanism is not supported!!!')
