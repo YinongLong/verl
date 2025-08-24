@@ -405,7 +405,6 @@ def compute_magistral_advantage(token_level_rewards: torch.Tensor, response_mask
         Returns: `(torch.Tensor)`
             shape: (bs, response_length)
     """
-    response_length = token_level_rewards.shape[-1]
     scores = token_level_rewards.sum(dim=-1)
 
     mask = (response_mask.sum(dim=-1) > 0).int()
@@ -419,9 +418,10 @@ def compute_magistral_advantage(token_level_rewards: torch.Tensor, response_mask
             id2score[index[i]].append(scores[i])
         for idx in id2score:
             if len(id2score[idx]) == 1:
-                id2mean[idx] = torch.tensor(id2score[idx][0])
+                id2mean[idx] = torch.tensor(0.0)
             elif len(id2score[idx]) > 1:
-                id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
+                scores_tensor = torch.stack(id2score[idx])
+                id2mean[idx] = torch.mean(scores_tensor)
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
         for i in range(bsz):
