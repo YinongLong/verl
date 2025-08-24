@@ -1297,7 +1297,7 @@ class RayPPOTrainer:
                                         repl_uids = []
                                         for guid, cnt in guid_counter.items():
                                             g_idxs = copy.deepcopy(guid2arr[guid])
-                                            for _ in cnt:
+                                            for _ in range(cnt):
                                                 repl_idxs.extend(g_idxs)
                                                 new_uid = str(uuid.uuid4())
                                                 repl_uids.extend([new_uid, ] * len(g_idxs))
