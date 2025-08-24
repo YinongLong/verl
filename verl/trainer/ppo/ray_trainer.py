@@ -1305,7 +1305,7 @@ class RayPPOTrainer:
                                         repl_batch = batch.select_idxs(repl_idxs)
                                         assert len(repl_batch) == len(repl_uids)
                                         for i in range(len(repl_uids)):
-                                            repl_batch.non_tensor_batch["uid"] = repl_uids[i]
+                                            repl_batch.non_tensor_batch["uid"][i] = repl_uids[i]
                                         wk_batch = DataProto.concat([good_batch, repl_batch])
                                 else:
                                     raise ValueError('This dynamic sampling mechanism is not supported!!!')
