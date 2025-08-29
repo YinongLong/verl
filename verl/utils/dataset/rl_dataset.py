@@ -19,7 +19,7 @@ import logging
 import os
 import re
 from collections import defaultdict
-from typing import Optional
+from typing import Optional, Union
 
 import datasets
 import numpy as np
@@ -166,11 +166,19 @@ class RLHFDataset(Dataset):
             else:
 
                 def doc2len(doc) -> int:
-                    return len(
-                        tokenizer.apply_chat_template(
-                            doc[prompt_key], add_generation_prompt=True, **self.apply_chat_template_kwargs
+                    prompt = doc[prompt_key]
+                    if isinstance(prompt, list):
+                        num_tokens = len(
+                            tokenizer.apply_chat_template(
+                                prompt, add_generation_prompt=True, **self.apply_chat_template_kwargs
+                            )
                         )
-                    )
+                    elif isinstance(prompt, str):
+                        num_tokens = len(tokenizer.encode(prompt))
+                    else:
+                        raise ValueError(f'the type of `prompt`({type(prompt)}) is not supported!!!')
+
+                    return num_tokens
 
             dataframe = dataframe.filter(
                 lambda doc: doc2len(doc) <= self.max_prompt_length,
@@ -194,7 +202,7 @@ class RLHFDataset(Dataset):
         return len(self.dataframe)
 
     def _build_messages(self, example: dict):
-        messages: list = example.pop(self.prompt_key)
+        messages: Union[list, str] = example.pop(self.prompt_key)
 
         if self.image_key in example or self.video_key in example:
             for message in messages:
@@ -266,9 +274,15 @@ class RLHFDataset(Dataset):
                 row_dict["multi_modal_inputs"].pop("second_per_grid_ts", None)
 
         else:
-            raw_prompt = self.tokenizer.apply_chat_template(
-                messages, add_generation_prompt=True, tokenize=False, **self.apply_chat_template_kwargs
-            )
+            if isinstance(messages, list):
+                raw_prompt = self.tokenizer.apply_chat_template(
+                    messages, add_generation_prompt=True, tokenize=False, **self.apply_chat_template_kwargs
+                )
+            elif isinstance(messages, str):
+                raw_prompt = messages
+            else:
+                raise ValueError(f'the type of `prompt`({type(messages)}) is not supported!!!')
+
             model_inputs = self.tokenizer(raw_prompt, return_tensors="pt", add_special_tokens=False)
             input_ids = model_inputs.pop("input_ids")
             attention_mask = model_inputs.pop("attention_mask")
@@ -325,7 +339,7 @@ class RLHFDataset(Dataset):
             row_dict["gt_tokens"] = gt_tokens
 
         # encode prompts without chat template
-        if self.return_raw_chat:
+        if self.return_raw_chat and isinstance(messages, list):
             row_dict["raw_prompt"] = messages
 
         # get prompts with chat template
