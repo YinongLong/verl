@@ -1139,7 +1139,13 @@ class RayPPOTrainer:
                                     num_prompts_in_acc_batch += len(good_uids)
                                     if good_traj_idxs:
                                         batch = batch.select_idxs(good_traj_idxs)
-                                        acc_batch = batch if acc_batch is None else DataProto.concat([acc_batch, batch])
+                                        batch.meta_info.pop("global_token_num", None)
+                                        if acc_batch is None:
+                                            acc_batch = batch
+                                        else:
+                                            acc_batch.meta_info.pop("global_token_num", None)
+                                            acc_batch = DataProto.concat([acc_batch, batch])
+                                        acc_batch.meta_info["global_token_num"] = torch.sum(acc_batch.batch["attention_mask"], dim=-1).tolist()
 
                                     train_bsz = self.config.data.train_batch_size
                                     if (num_prompts_in_acc_batch < train_bsz) and (not is_last_step):
@@ -1185,7 +1191,11 @@ class RayPPOTrainer:
                                         assert len(repl_batch) == len(repl_uids)
                                         for i in range(len(repl_uids)):
                                             repl_batch.non_tensor_batch["uid"][i] = repl_uids[i]
+
+                                        good_batch.meta_info.pop("global_token_num", None)
+                                        repl_batch.meta_info.pop("global_token_num", None)
                                         wk_batch = DataProto.concat([good_batch, repl_batch])
+                                        wk_batch.meta_info["global_token_num"] = torch.sum(wk_batch.batch["attention_mask"], dim=-1).tolist()
                                 else:
                                     raise ValueError('This dynamic sampling mechanism is not supported!!!')
                             else:
