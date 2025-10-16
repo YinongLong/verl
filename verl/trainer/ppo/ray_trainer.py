@@ -1206,6 +1206,7 @@ class RayPPOTrainer:
                                         wk_batch = acc_batch[:traj_bsz]
                                         acc_batch = acc_batch[traj_bsz:]
                                         num_prompts_in_acc_batch -= train_bsz
+                                        num_prompts_in_acc_batch = max(0, num_prompts_in_acc_batch)
                                 elif self.config.algorithm.filter_groups.filter_type == 'POLARIS':
                                     if not good_uids:
                                         pprint('cannot find informative samples. keep generating...')
@@ -1300,7 +1301,7 @@ class RayPPOTrainer:
                         # Compute rollout importance sampling weights centrally (once per batch)
                         # This corrects for mismatch between rollout policy and training policy
                         # Also computes mismatch metrics (KL, PPL, etc.)
-                        batch, is_metrics = self.compute_rollout_importance_weights_and_add_to_batch(batch)
+                        wk_batch, is_metrics = self.compute_rollout_importance_weights_and_add_to_batch(wk_batch)
                         # IS and mismatch metrics already have mismatch/ prefix
                         metrics.update(is_metrics)
 

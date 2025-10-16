@@ -657,6 +657,7 @@ class SGLangRollout(BaseRollout):
                 if not non_tensor_batch["gt_tokens"][i]:
                     continue
                 index2gt_ids[i] = non_tensor_batch["gt_tokens"][i]
+            non_tensor_batch.pop("gt_tokens")
 
         if "multi_modal_data" in non_tensor_batch:
             sglang_inputs = []
